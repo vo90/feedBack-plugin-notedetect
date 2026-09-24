@@ -38,13 +38,14 @@ const CHART = Array.from({ length: NOTE_COUNT }, (_, i) => ({
     s: 0, f: 3, t: Number((i * 0.1).toFixed(3)), sus: 0,
 }));
 
-function sandbox() {
+function sandbox(chartNotes = CHART, harmonicVersion = 1) {
     const calls = { getNoteVerdicts: 0, getPitchDetection: 0 };
     let pushedChart = null;
     const verdictQueue = [];
     const intervalCallbacks = [];
 
     const audio = {
+        harmonicTargetVersion: async () => harmonicVersion,
         isAvailable: async () => true,
         isAudioRunning: async () => true,
         startAudio: async () => {},
@@ -68,7 +69,7 @@ function sandbox() {
                 if (typeof cb === 'function') intervalCallbacks.push(cb);
                 return intervalCallbacks.length;
             };
-            sb.highway.getNotes = () => CHART.map((n) => ({ ...n }));
+            sb.highway.getNotes = () => chartNotes.map((n) => ({ ...n }));
             sb.highway.getChords = () => ([]);
             sb.highway.getTime = () => hwTime;
             sb.highway.getAvOffset = () => 0;
@@ -82,6 +83,7 @@ function sandbox() {
         // Every id the engine was told about, in chart order.
         chartIds: () => (pushedChart && pushedChart.notes
             ? pushedChart.notes.map((n) => n.id) : []),
+        chart: () => pushedChart,
     };
 }
 
@@ -158,4 +160,33 @@ test('engine-verifier: re-delivered verdicts do not double-count after the noteR
 
     det.destroy();
     await flushPendingAsync();
+});
+
+for (const targetFret of [7,19]) test(`feedback attack at ${targetFret} counts once alongside ordinary notes`, async () => {
+    const target={kind:'feedback',node:12,interval:12,policy:'attack_either'};
+    const notes=[{s:0,f:7,t:1,sus:8,harmonic_target:target},{s:1,f:5,t:2,sus:0}];
+    const env=sandbox(notes); const det=env.createNoteDetector({isDefault:false});
+    await det.enable();await flushPendingAsync();
+    const tick=await driveDetectTick(env.intervalCallbacks,env.calls);
+    assert.equal(env.chartIds().length,2,'sustain/contact must not add chart targets');
+    assert.deepEqual(JSON.parse(JSON.stringify(env.chart().notes[0].harmonic_target)),target);
+    const verdicts=env.chartIds().map((id,i)=>({id,detected:true,detectedSongTime:notes[i].t,
+        centsError:0,snr:6,targetFret:i===0?targetFret:5}));
+    env.verdictQueue.push(verdicts);await tick();await flushPendingAsync();
+    assert.equal(det.getStats().hits,2);assert.equal(det.getStats().misses,0);
+    const score=det.getStats().score;
+    env.setHwTime(12);env.verdictQueue.push(verdicts);await tick();await flushPendingAsync();
+    assert.equal(det.getStats().hits,2);assert.equal(det.getStats().score,score);
+    det.destroy();await flushPendingAsync();
+});
+
+test('old native engines do not grade explicit harmonics as ordinary notes or misses',async()=>{
+    const env=sandbox([{s:0,f:7,t:1,sus:2,harmonic_target:{kind:'tapped',node:12,interval:12,policy:'harmonic'}}],0);
+    const det=env.createNoteDetector({isDefault:false});await det.enable();await flushPendingAsync();
+    await driveDetectTick(env.intervalCallbacks,env.calls);
+    assert.equal(env.chartIds().length,0);
+    env.setHwTime(20);
+    for(const cb of env.intervalCallbacks){await cb();await flushPendingAsync();}
+    assert.equal(det.getStats().hits,0);assert.equal(det.getStats().misses,0);
+    det.destroy();await flushPendingAsync();
 });

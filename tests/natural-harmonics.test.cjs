@@ -10,7 +10,7 @@ function fn(name){
     }
     throw Error(name);
 }
-const names=['_ndStandardMidiFor','_ndNaturalPitchSemitones','_ndPreciseHarmonic','_ndScoringFret','_ndMidiFromStringFret',
+const names=['_ndStandardMidiFor','_ndNaturalPitchSemitones','_ndPreciseHarmonic','_ndFrettedHarmonic','_ndScoringFret','_ndMidiFromStringFret',
     '_ndNextPow2','_ndFftInPlace','_ndFftMagnitude','_ndParabolicOffset','_ndCheckNaturalHarmonic'];
 const h=new Function(source.match(/^const _ND_TUNING_.+$/gm).join('\n')+
     '\nlet _ndFftInterleavedScratch=null,_ndFftMagnitudesScratch=null,_ndFftScratchSize=0;\n'+

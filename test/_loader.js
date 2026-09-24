@@ -20,6 +20,7 @@ function makeSandbox() {
             if (prop === 'classList') return { add: noop, remove: noop, toggle: noop };
             if (prop === 'addEventListener' || prop === 'removeEventListener') return noop;
             if (prop === 'appendChild' || prop === 'removeChild') return noop;
+            if (prop === 'setAttribute' || prop === 'remove') return noop;
             if (prop === 'querySelector' || prop === 'querySelectorAll') return () => null;
             return '';
         },
@@ -306,6 +307,7 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
                     s: x.s, f: x.f, hit: x.hit,
                     bandEnergy: x.bandEnergy, centsDiff: x.centsDiff,
                     centsError: x.centsError,
+                    targetFret: x.targetFret,
                 })),
             };
         },

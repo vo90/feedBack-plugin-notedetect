@@ -625,7 +625,22 @@ function _ndExcludeTarget(n) {
     return !n || !!n.mt || _ndIsVisualPickScrape(n);
 }
 
-function _ndScoringFret(n) { return _ndPreciseHarmonic(n) ? _ndNaturalPitchSemitones(n.hps) : n.f; }
+function _ndFrettedHarmonic(n) {
+    const h = n?.harmonic_target;
+    const nodes = {12:12,7:19,19:19,5:24,24:24,4:28,9:28,16:28,3.2:31,
+        2.7:34,5.8:34,9.6:34,14.7:34,21.7:34,2.4:36,8.2:36,17:36};
+    const policies = {pinch:'harmonic',artificial:'harmonic',tapped:'harmonic',semi:'mixed',feedback:'attack_either'};
+    return h && Object.keys(h).length === 4 && Number.isFinite(h.node)
+        && Number.isInteger(h.interval) && nodes[h.node] === h.interval
+        && Object.hasOwn(policies,h.kind) && policies[h.kind] === h.policy
+        && !n.hm && Number.isInteger(n.f) && n.f >= 0 && n.f <= 48 ? h : null;
+}
+function _ndScoringFret(n, result) {
+    const h = _ndFrettedHarmonic(n);
+    if (h?.policy === 'attack_either' && result?.targetFret === n.f) return n.f;
+    return h ? n.f + _ndNaturalPitchSemitones(h.interval)
+        : _ndPreciseHarmonic(n) ? _ndNaturalPitchSemitones(n.hps) : n.f;
+}
 
 function _ndMidiFromStringFret(string, fret, arrangement, stringCount, offsets, capo) {
     const base = _ndStandardMidiFor(arrangement, stringCount);
@@ -2098,6 +2113,40 @@ function _ndCheckNaturalHarmonic(spectrum, total, note, arrangement, strings, of
         bandEnergy: snr, centsDiff: Math.abs(error), centsError: error};
 }
 
+// Explicit fretted targets use the same physical partial as native scoring.
+// Semi permits its fretted component but still needs selected-partial evidence.
+function _ndCheckFrettedHarmonic(spectrum, total, note, arrangement, strings, offsets, capo, tolerance) {
+    const h = _ndFrettedHarmonic(note);
+    if (!h) return {hit:false,bandEnergy:0,centsDiff:null,centsError:null};
+    const {magnitudes:m,binHz}=spectrum;
+    const baseMidi=_ndMidiFromStringFret(note.s,note.f,arrangement,strings,offsets,capo);
+    const baseHz=440*2**((baseMidi-69)/12);
+    const partial=2**(_ndNaturalPitchSemitones(h.interval)/12);
+    const mag=hz=>{
+        const lo=Math.max(1,Math.floor(hz*.971/binHz)),hi=Math.min(m.length-2,Math.ceil(hz*1.030/binHz));
+        let v=0;for(let k=lo;k<=hi;k++)v=Math.max(v,m[k]);return v;
+    };
+    const cents=note.b||note.sl ? Math.max(tolerance,100) : tolerance;
+    const check=_ndCheckNaturalHarmonic(spectrum,total,note,arrangement,strings,offsets,capo,cents,false);
+    const selected=mag(baseHz*partial),base=mag(baseHz);
+    let evidence=selected >= base*(h.policy==='mixed' ? .65 : 1.05);
+    for(let p=2;p<=8;p++) {
+        // Multiples of the selected partial belong to that harmonic's own
+        // timbre; a bright harmonic must not fail because its octave is strong.
+        if(Math.abs(p/partial-Math.round(p/partial))<.001)continue;
+        if(mag(baseHz*p)>selected*1.05)evidence=false;
+    }
+    check.hit=check.hit && evidence;
+    check.targetFret=_ndScoringFret(note);
+    if (!check.hit && h.policy==='attack_either') {
+        const ordinary={...note};delete ordinary.harmonic_target;
+        const other=_ndCheckNaturalHarmonic(spectrum,total,ordinary,arrangement,strings,offsets,capo,cents,false);
+        other.targetFret=note.f;
+        return other;
+    }
+    return check;
+}
+
 // Count how many of the expected note's harmonics (k·f0 for the configured
 // ratios) appear as a genuine LOCAL-MAXIMUM spectral peak whose magnitude is at
 // least _ND_HARMONIC_FALLBACK_PEAK_FRAC of the band's peak, within
@@ -2237,7 +2286,9 @@ function _ndScoreChord(buffer, sampleRate, chordNotes, arrangement, stringCount,
             cents = 0;
         }
 
-        const check = _ndPreciseHarmonic(cn)
+        const check = cn.harmonic_target !== undefined
+            ? _ndCheckFrettedHarmonic(spectrum, totalEnergy, cn, arrangement, stringCount, offsets, capo, pitchCheckCents)
+            : _ndPreciseHarmonic(cn)
             ? _ndCheckNaturalHarmonic(spectrum, totalEnergy, cn, arrangement, stringCount, offsets, capo, pitchCheckCents, chordNotes.length === 1)
             : _ndConstraintCheckString(
             buffer, sampleRate,
@@ -3575,8 +3626,27 @@ function createNoteDetector(options = {}) {
             ? typeof a.scoreSourceChord === 'function'
             : typeof a.scoreChord === 'function';
     }
-    function _ndBridgeScoreChord(ctx) {
+    let _ndHarmonicSupportBlocked = false;
+    const _ndHarmonicBridgeVersions = new WeakMap();
+    async function _ndRequireHarmonicTargetSupport(a, notes) {
+        if (!(notes || []).some(n => n?.harmonic_target !== undefined)) return;
+        if (!_ndHarmonicBridgeVersions.has(a)) _ndHarmonicBridgeVersions.set(a,
+            typeof a.harmonicTargetVersion === 'function' ? a.harmonicTargetVersion() : Promise.resolve(0));
+        if (await _ndHarmonicBridgeVersions.get(a) !== 1) {
+            _ndHarmonicSupportBlocked = true;
+            const message='Scoring paused: these harmonics require an updated FeedBack Desktop audio engine.';
+            if (!instanceRoot.querySelector('.nd-harmonic-compatibility')) {
+                const banner=document.createElement('div');
+                banner.className='nd-harmonic-compatibility fixed top-3 left-1/2 -translate-x-1/2 z-[300] bg-red-900 text-white rounded px-4 py-2 text-sm';
+                banner.setAttribute('role','alert');banner.textContent=message;instanceRoot.appendChild(banner);
+            }
+            throw new Error(message);
+        }
+        _ndHarmonicSupportBlocked = false;
+    }
+    async function _ndBridgeScoreChord(ctx) {
         const a = _ndBridgeAudio(); if (!a) return Promise.resolve(null);
+        await _ndRequireHarmonicTargetSupport(a, ctx.notes);
         if (sourceId != null && typeof a.scoreSourceChord === 'function')
             return a.scoreSourceChord(sourceId, ctx);
         if (sourceId == null && typeof a.scoreChord === 'function')
@@ -3589,8 +3659,13 @@ function createNoteDetector(options = {}) {
             ? (typeof a.setSourceChart === 'function' && typeof a.getSourceNoteVerdicts === 'function')
             : (typeof a.setChart === 'function' && typeof a.getNoteVerdicts === 'function');
     }
-    function _ndBridgeSetChart(chart) {
+    async function _ndBridgeSetChart(chart) {
         const a = _ndBridgeAudio(); if (!a) return Promise.resolve(null);
+        if (!(chart.notes || []).some(n=>n.harmonic_target !== undefined)) {
+            _ndHarmonicSupportBlocked=false;
+            instanceRoot.querySelector('.nd-harmonic-compatibility')?.remove();
+        }
+        await _ndRequireHarmonicTargetSupport(a, chart.notes);
         if (sourceId != null && typeof a.setSourceChart === 'function')
             return a.setSourceChart(sourceId, chart);
         if (sourceId == null && typeof a.setChart === 'function')
@@ -5419,6 +5494,9 @@ function createNoteDetector(options = {}) {
     // per audio frame for sustained-and-hit chords so held chords glow
     // the same way held single notes do.
     function _sustainStillHeld(key, note) {
+        // Feedback is graded only at its initial attack. Its authored trail is
+        // visual and must not ask the player to maintain amplifier feedback.
+        if (_ndFrettedHarmonic(note)?.policy === 'attack_either') return false;
         const nowMs = (typeof performance !== 'undefined' && performance.now)
             ? performance.now() : Date.now();
         if (detectedMidi >= 0 && detectedConfidence > detectionConfidenceMin) {
@@ -5882,6 +5960,7 @@ function createNoteDetector(options = {}) {
     }
 
     function recordJudgment(key, judgment, { count = true, emit = true } = {}) {
+        if (_ndHarmonicSupportBlocked) return;
         if (_ndIsVisualPickScrape(judgment?.note)
                 || judgment?.notes?.length && judgment.notes.every(_ndIsVisualPickScrape)) return;
         // slopsmith#254 — stamp the song-time at which this verdict became
@@ -6061,6 +6140,7 @@ function createNoteDetector(options = {}) {
     }
 
     async function matchNotes(frameBuffer) {
+        if (_ndHarmonicSupportBlocked) return;
         const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
         const t = hw.getTime() + avOffsetSec - latencyOffset;
         // A/V auto-calibration tap (browser + desktop-yin/ml paths). The
@@ -6246,7 +6326,7 @@ function createNoteDetector(options = {}) {
                         notes: _ndSingleNotes.map(cn => ({
                             s: cn.s, f: cn.f,
                             ho: !!cn.ho, po: !!cn.po,
-                            b: !!cn.b, sl: !!cn.sl, hm: !!cn.hm, hps: cn.hps,
+                            b: !!cn.b, sl: !!cn.sl, hm: !!cn.hm, hps: cn.hps, harmonic_target: cn.harmonic_target,
                         })),
                     };
                     const gen = sessionGen;
@@ -6321,7 +6401,7 @@ function createNoteDetector(options = {}) {
                 // the note if none ever does.
                 const pitchError = Number.isFinite(r.centsError) ? r.centsError : null;
                 const expectedMidi = _ndMidiFromStringFret(
-                    cn.s, _ndScoringFret(cn), currentArrangement, currentStringCount, tuningOffsets, capo
+                    cn.s, _ndScoringFret(cn, r), currentArrangement, currentStringCount, tuningOffsets, capo
                 );
                 const detectedMidiForJudgment = Number.isFinite(pitchError)
                     ? expectedMidi + pitchError / 100
@@ -6386,7 +6466,7 @@ function createNoteDetector(options = {}) {
                         notes: group.map(cn => ({
                             s: cn.s, f: cn.f,
                             ho: !!cn.ho, po: !!cn.po,
-                            b: !!cn.b, sl: !!cn.sl, hm: !!cn.hm, hps: cn.hps,
+                            b: !!cn.b, sl: !!cn.sl, hm: !!cn.hm, hps: cn.hps, harmonic_target: cn.harmonic_target,
                         })),
                     };
                     const gen = sessionGen;
@@ -6666,6 +6746,7 @@ function createNoteDetector(options = {}) {
     }
 
     function checkMisses() {
+        if (_ndHarmonicSupportBlocked) return;
         if (!enabled) return;
         // On the engine-verifier path the engine finalizes misses itself
         // (detected:false verdicts, drained by _ndDrainEngineVerdicts), so
@@ -10554,7 +10635,7 @@ function createNoteDetector(options = {}) {
                 po: !!n.po,
                 b: !!n.b,
                 sl: !!n.sl,
-                hm: !!n.hm, hps: n.hps,
+                hm: !!n.hm, hps: n.hps, harmonic_target: n.harmonic_target,
             })),
         };
         try {
@@ -10573,7 +10654,7 @@ function createNoteDetector(options = {}) {
         const r = batch.results[0];
         const flags = {
             ho: !!noteDef.ho, po: !!noteDef.po,
-            b: !!noteDef.b, sl: !!noteDef.sl, hm: !!noteDef.hm, hps: noteDef.hps,
+            b: !!noteDef.b, sl: !!noteDef.sl, hm: !!noteDef.hm, hps: noteDef.hps, harmonic_target: noteDef.harmonic_target,
         };
         const tick = _calLabTickFromResult(r, flags);
         return {
@@ -10594,7 +10675,7 @@ function createNoteDetector(options = {}) {
             const nd = notes[i] || { s: r.s, f: r.f };
             const flags = {
                 ho: !!nd.ho, po: !!nd.po,
-                b: !!nd.b, sl: !!nd.sl, hm: !!nd.hm, hps: nd.hps,
+                b: !!nd.b, sl: !!nd.sl, hm: !!nd.hm, hps: nd.hps, harmonic_target: nd.harmonic_target,
             };
             return { string: nd.s, fret: nd.f, ..._calLabTickFromResult(r, flags) };
         });
@@ -13758,6 +13839,11 @@ function createNoteDetector(options = {}) {
             mix(Math.round((Number.isFinite(nn.t) ? nn.t : 0) * 1000));
             mix(((nn.s | 0) * 100) + (nn.f | 0));
             mix(_ndPreciseHarmonic(nn) ? nn.hps : -1);
+            const target = nn.harmonic_target;
+            if (target) {
+                mix(Math.round(target.node * 1000)); mix(target.interval);
+                for (const ch of String(target.kind) + ':' + String(target.policy)) mix(ch.charCodeAt(0));
+            }
             mix(Math.round((Number.isFinite(nn.sus) ? nn.sus : 0) * 1000));
             mix((nn.ho ? 1 : 0) | (nn.po ? 2 : 0) | (nn.b ? 4 : 0)
                 | (nn.sl ? 8 : 0) | (nn.hm ? 16 : 0) | (nn.mt ? 32 : 0) | (_ndIsVisualPickScrape(nn) ? 64 : 0));
@@ -13828,7 +13914,7 @@ function createNoteDetector(options = {}) {
                 s: n.s,
                 f: n.f,
                 sus: Number.isFinite(n.sus) ? n.sus : 0,
-                ho: !!n.ho, po: !!n.po, b: !!n.b, sl: !!n.sl, hm: !!n.hm, hps: n.hps,
+                ho: !!n.ho, po: !!n.po, b: !!n.b, sl: !!n.sl, hm: !!n.hm, hps: n.hps, harmonic_target: n.harmonic_target,
             };
             notes.push(entry);
             byId.set(id, { ...n });
@@ -13847,7 +13933,7 @@ function createNoteDetector(options = {}) {
                     s: cn.s,
                     f: cn.f,
                     sus: Number.isFinite(cn.sus) ? cn.sus : 0,
-                    ho: !!cn.ho, po: !!cn.po, b: !!cn.b, sl: !!cn.sl, hm: !!cn.hm, hps: cn.hps,
+                    ho: !!cn.ho, po: !!cn.po, b: !!cn.b, sl: !!cn.sl, hm: !!cn.hm, hps: cn.hps, harmonic_target: cn.harmonic_target,
                 };
                 notes.push(entry);
                 byId.set(id, { ...cn, t: c.t });
@@ -14060,7 +14146,7 @@ function createNoteDetector(options = {}) {
             if (_ndAlreadyCounted(key)) { _ndDrainStats.suppressedRedelivery++; continue; }
 
             const expectedMidi = _ndMidiFromStringFret(
-                cn.s, _ndScoringFret(cn), currentArrangement, currentStringCount, tuningOffsets, capo
+                cn.s, _ndScoringFret(cn, v), currentArrangement, currentStringCount, tuningOffsets, capo
             );
             if (v.detected) {
                 // detectedSongTime is the playhead the renderer pushed, which
@@ -14252,7 +14338,7 @@ function createNoteDetector(options = {}) {
             const mcn = _ndVerifierChartById.get(id);
             if (!mcn) continue;
             const mExpectedMidi = _ndMidiFromStringFret(
-                mcn.s, _ndScoringFret(mcn), currentArrangement, currentStringCount, tuningOffsets, capo
+                mcn.s, _ndScoringFret(mcn, verdictMap.get(id)), currentArrangement, currentStringCount, tuningOffsets, capo
             );
             // The noteResults entry is stamped with the chord-level verdict
             // (so the highway tints every chord gem and the chord frame
@@ -14402,7 +14488,7 @@ function createNoteDetector(options = {}) {
                 s: n.s,
                 f: n.f,
                 sus: Number.isFinite(n.sus) ? n.sus : 0,
-                ho: !!n.ho, po: !!n.po, b: !!n.b, sl: !!n.sl, hm: !!n.hm, hps: n.hps,
+                ho: !!n.ho, po: !!n.po, b: !!n.b, sl: !!n.sl, hm: !!n.hm, hps: n.hps, harmonic_target: n.harmonic_target,
             };
             entries.push(entry);
             byId.set(n.id, { ...n });
@@ -18178,7 +18264,7 @@ function createNoteDetector(options = {}) {
                     && Number.isInteger(n.f) && n.f >= 0)
                 .map(n => ({
                     s: n.s, f: n.f,
-                    ho: !!n.ho, po: !!n.po, b: !!n.b, sl: !!n.sl, hm: !!n.hm, hps: n.hps,
+                    ho: !!n.ho, po: !!n.po, b: !!n.b, sl: !!n.sl, hm: !!n.hm, hps: n.hps, harmonic_target: n.harmonic_target,
                 }));
             let cleanNotes = clean.length ? clean : null;
             // A ctx only makes sense alongside a live target.
