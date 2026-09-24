@@ -29,10 +29,28 @@ test('practice denominator ignores scrape-only events but retains a mixed chord 
     }
     const count=new Function('notes','chords',`
         const resolveHw=()=>({}), _ndChartNotes=()=>notes, _ndChartChords=()=>chords;
-        ${fn('_ndIsVisualPickScrape')}${fn('_drillChartedCount')}
+        ${fn('_ndIsVisualPickScrape')}${fn('_ndIsVisualGesture')}${fn('_ndBarLimitation')}${fn('_ndPreciseHarmonic')}${fn('_drillChartedCount')}
         return _drillChartedCount(0,3);`);
     assert.equal(count([scrape],[{t:1,notes:[scrape]}]),0);
     assert.equal(count([scrape,ordinary],[{t:1,notes:[scrape,ordinary]}]),2);
+    const bar = {...ordinary, whammy:{version:1,policy:'optional',segments:[
+        {start:0,end:.5,source_id:'beat',group:'beat@0',curve:[],vibrato:'wide'}]}};
+    assert.equal(count([bar],[{t:1,notes:[bar]}]),0);
+    assert.equal(count([bar],[{t:1,notes:[bar,ordinary]}]),1);
+});
+
+test('visual-only bar events cannot change score or streak through stale judgments', () => {
+    const core=loadDetectionCore(),det=core.createNoteDetector();
+    const bar={...ordinary,whammy:{version:1,policy:'optional',segments:[
+        {start:0,end:.5,source_id:'beat',group:'beat@0',curve:[],vibrato:'slight'}]}};
+    det._recordJudgment('before',{note:ordinary,hit:true,noteTime:1});
+    const before=JSON.stringify(det.getStats());
+    for(const hit of [true,false]) {
+        det._recordJudgment('bar',{note:bar,hit,noteTime:1});
+        det._recordJudgment('bars',{notes:[bar,{...bar,s:2}],chord:true,hit,noteTime:1});
+    }
+    assert.equal(JSON.stringify(det.getStats()),before);
+    det.destroy();
 });
 
 test('Desktop chart submission excludes visual scrapes and keeps the pitched mixed member', async () => {
