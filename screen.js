@@ -616,6 +616,15 @@ function _ndNaturalPitchSemitones(semitones) {
     const partial = ({12:2,19:3,24:4,28:5,31:6,34:7,36:8})[semitones];
     return partial ? 12 * Math.log2(partial) : semitones;
 }
+// Typed visual gestures are never detector targets, even if a chart transform
+// reconstructs a member without carrying its mute flag.
+function _ndIsVisualPickScrape(n) {
+    return Array.isArray(n?.pick_scrape_marks) && n.pick_scrape_marks.length > 0;
+}
+function _ndExcludeTarget(n) {
+    return !n || !!n.mt || _ndIsVisualPickScrape(n);
+}
+
 function _ndScoringFret(n) { return _ndPreciseHarmonic(n) ? _ndNaturalPitchSemitones(n.hps) : n.f; }
 
 function _ndMidiFromStringFret(string, fret, arrangement, stringCount, offsets, capo) {
@@ -5318,6 +5327,7 @@ function createNoteDetector(options = {}) {
     // chord's time (matches how noteResults keys chord notes). Must stay
     // cheap: called per note per renderer per frame.
     function noteStateFor(note, chartTime) {
+        if (_ndIsVisualPickScrape(note)) return null;
         if (!enabled || !note || !Number.isFinite(chartTime)) return null;
         const key = noteKey(note, chartTime);
         const j = noteResults.get(key);
@@ -5872,6 +5882,8 @@ function createNoteDetector(options = {}) {
     }
 
     function recordJudgment(key, judgment, { count = true, emit = true } = {}) {
+        if (_ndIsVisualPickScrape(judgment?.note)
+                || judgment?.notes?.length && judgment.notes.every(_ndIsVisualPickScrape)) return;
         // slopsmith#254 — stamp the song-time at which this verdict became
         // known. noteStateFor() measures the highway gem's hit/miss display
         // window from here, not from the note's chart time: the engine
@@ -6109,7 +6121,7 @@ function createNoteDetector(options = {}) {
             for (let i = start; i < notes.length; i++) {
                 const n = notes[i];
                 if (n.t > t + tolerance) break;
-                if (n.mt) continue;
+                if (_ndExcludeTarget(n)) continue;
                 // Non-sus notes use the strict past edge; sus notes get
                 // a grace bounded by both the chart's declared sustain
                 // and the global cap.
@@ -6144,13 +6156,13 @@ function createNoteDetector(options = {}) {
                 if (c.t > t + tolerance) break;
                 let chordSus = 0;
                 for (const cn of (c.notes || [])) {
-                    if (cn.mt) continue;
+                    if (_ndExcludeTarget(cn)) continue;
                     if (Number.isFinite(cn.sus) && cn.sus > chordSus) chordSus = cn.sus;
                 }
                 const lateGrace = chordSus > 0 ? Math.min(chordSus, MAX_SUS_LATE_GRACE) : 0;
                 if (c.t < t - tolerance - lateGrace) continue;
                 for (const cn of (c.notes || [])) {
-                    if (cn.mt) continue;
+                    if (_ndExcludeTarget(cn)) continue;
                     // Chord constituent notes don't carry their own time —
                     // the chord's `c.t` is the timestamp.
                     candidateNotes.push({ ...cn, t: c.t });
@@ -6775,7 +6787,7 @@ function createNoteDetector(options = {}) {
             for (let i = start; i < notes.length; i++) {
                 const n = notes[i];
                 if (n.t > missDeadline) break;
-                if (n.mt) continue;
+                if (_ndExcludeTarget(n)) continue;
                 checkNote(n, n.t);
             }
         }
@@ -6784,7 +6796,7 @@ function createNoteDetector(options = {}) {
             for (let i = start; i < chords.length; i++) {
                 const c = chords[i];
                 if (c.t > missDeadline) break;
-                const liveNotes = (c.notes || []).filter(cn => !cn.mt);
+                const liveNotes = (c.notes || []).filter(cn => !_ndExcludeTarget(cn));
                 if (liveNotes.length === 0) continue;
                 if (liveNotes.length === 1) {
                     // Degenerate "chord" of one — treat as a single note.
@@ -12465,7 +12477,7 @@ function createNoteDetector(options = {}) {
             for (const n of notes) {
                 if (n.t < renderT - missMarkerDuration - 0.2) continue;
                 if (n.t > renderT + 3) break;
-                if (n.mt) continue;
+                if (_ndExcludeTarget(n)) continue;
                 const key = noteKey(n, n.t);
                 const result = noteResults.get(key);
                 if (result) drawIndicator(n.s, n.f, n.t, result);
@@ -12476,7 +12488,7 @@ function createNoteDetector(options = {}) {
                 if (c.t < renderT - missMarkerDuration - 0.2) continue;
                 if (c.t > renderT + 3) break;
                 for (const cn of (c.notes || [])) {
-                    if (cn.mt) continue;
+                    if (_ndExcludeTarget(cn)) continue;
                     const key = noteKey(cn, c.t);
                     const result = noteResults.get(key);
                     if (result) drawIndicator(cn.s, cn.f, c.t, result);
@@ -13116,9 +13128,9 @@ function createNoteDetector(options = {}) {
         };
         let n = 0;
         const notes = _ndChartNotes(_hw);
-        for (const x of notes) if (inWin(x)) n++;
+        for (const x of notes) if (inWin(x) && !_ndIsVisualPickScrape(x)) n++;
         const chords = _ndChartChords(_hw);
-        for (const x of chords) if (inWin(x)) n++;
+        for (const x of chords) if (inWin(x) && (x.notes || []).some(cn => !_ndIsVisualPickScrape(cn))) n++;
         return n;
     }
 
@@ -13748,7 +13760,7 @@ function createNoteDetector(options = {}) {
             mix(_ndPreciseHarmonic(nn) ? nn.hps : -1);
             mix(Math.round((Number.isFinite(nn.sus) ? nn.sus : 0) * 1000));
             mix((nn.ho ? 1 : 0) | (nn.po ? 2 : 0) | (nn.b ? 4 : 0)
-                | (nn.sl ? 8 : 0) | (nn.hm ? 16 : 0) | (nn.mt ? 32 : 0));
+                | (nn.sl ? 8 : 0) | (nn.hm ? 16 : 0) | (nn.mt ? 32 : 0) | (_ndIsVisualPickScrape(nn) ? 64 : 0));
         };
         for (const nn of notes) if (nn) mixNote(nn);
         for (const ch of _ndChartChords()) {
@@ -13807,7 +13819,7 @@ function createNoteDetector(options = {}) {
         // matchNotes path skips them too (`if (n.mt) continue`).
         const single = _ndChartNotes();
         for (const n of single) {
-            if (!n || n.mt) continue;
+            if (_ndExcludeTarget(n)) continue;
             const id = noteKey(n, n.t);
             if (byId.has(id)) continue;
             const entry = {
@@ -13826,7 +13838,7 @@ function createNoteDetector(options = {}) {
         const chords = _ndChartChords();
         for (const c of chords) {
             for (const cn of (c.notes || [])) {
-                if (!cn || cn.mt) continue;
+                if (_ndExcludeTarget(cn)) continue;
                 const id = noteKey(cn, c.t);
                 if (byId.has(id)) continue;
                 const entry = {
