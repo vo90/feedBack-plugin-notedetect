@@ -607,6 +607,17 @@ function _ndMidiToName(midi) {
     return _ND_PITCH_NAMES[pc] + octave;
 }
 
+// Explicit natural harmonics retain source fret identity but target their
+// sounding pitch. Do not reinterpret legacy hm-only charts.
+function _ndPreciseHarmonic(n) {
+    return n?.hm === true && Number.isInteger(n.hps) && n.hps > 0 && n.hps <= 48;
+}
+function _ndNaturalPitchSemitones(semitones) {
+    const partial = ({12:2,19:3,24:4,28:5,31:6,34:7,36:8})[semitones];
+    return partial ? 12 * Math.log2(partial) : semitones;
+}
+function _ndScoringFret(n) { return _ndPreciseHarmonic(n) ? _ndNaturalPitchSemitones(n.hps) : n.f; }
+
 function _ndMidiFromStringFret(string, fret, arrangement, stringCount, offsets, capo) {
     const base = _ndStandardMidiFor(arrangement, stringCount);
     const offset = offsets && offsets[string] !== undefined ? offsets[string] : 0;
@@ -1432,7 +1443,7 @@ function _ndNearestOctaveCents(detectedMidi, expectedMidi) {
 function _ndResolveDisplayFingering(detectedMidi, candidateNotes, arrangement, stringCount, offsets, capo, pitchToleranceCents) {
     if (candidateNotes && candidateNotes.length > 0) {
         for (const cn of candidateNotes) {
-            const expected = _ndMidiFromStringFret(cn.s, cn.f, arrangement, stringCount, offsets, capo);
+            const expected = _ndMidiFromStringFret(cn.s, _ndScoringFret(cn), arrangement, stringCount, offsets, capo);
             if (Math.abs(_ndNearestOctaveCents(detectedMidi, expected)) <= pitchToleranceCents) {
                 return { string: cn.s, fret: cn.f, displayMidi: expected };
             }
@@ -1552,7 +1563,7 @@ function _ndCalibrateOffsetMs(detections, chartNotes, geom, hitWindowS, pitchTol
     for (const n of chartNotes) {
         const t = (n.time != null) ? n.time : n.t;
         if (t == null || n.s == null || n.f == null) continue;
-        const em = _ndMidiFromStringFret(n.s, n.f, geom.arrangement, geom.stringCount, geom.offsets, geom.capo);
+        const em = _ndMidiFromStringFret(n.s, _ndScoringFret(n), geom.arrangement, geom.stringCount, geom.offsets, geom.capo);
         if (Number.isFinite(em)) exp.push({ t, em });
     }
     if (exp.length < minMatched) return null;
@@ -2049,6 +2060,35 @@ function _ndConstraintCheckString(
     return { hit, bandEnergy, centsDiff, centsError };
 }
 
+// Browser counterpart of the native explicit-pitch comb. Presence must
+// include the sounding fundamental; an octave or the rounded fretted note
+// cannot pass as an energy-only harmonic hit.
+function _ndCheckNaturalHarmonic(spectrum, total, note, arrangement, strings, offsets, capo, tolerance, solo = true) {
+    const {magnitudes: m, binHz} = spectrum;
+    const midi = _ndMidiFromStringFret(note.s, _ndScoringFret(note), arrangement, strings, offsets, capo);
+    const f0 = 440 * Math.pow(2, (midi - 69) / 12);
+    const peak = hz => {
+        const lo = Math.max(1, Math.floor(hz * .971 / binHz));
+        const hi = Math.min(m.length - 2, Math.ceil(hz * 1.030 / binHz));
+        let k = lo;
+        for (let j = lo; j <= hi; j++) if (m[j] > m[k]) k = j;
+        if (lo > hi) return {mag: 0, hz};
+        return {mag: m[k], hz: (k + _ndParabolicOffset(m[k-1],m[k],m[k+1])) * binHz};
+    };
+    const fundamental = peak(f0);
+    let energy = 0, floor = 0, strongest = 0;
+    for (let h=1; h<=5; h++) {
+        const p=peak(f0*h); energy += p.mag*p.mag; strongest=Math.max(strongest,p.mag);
+        const q=peak(f0*(h+.5)); floor += q.mag*q.mag;
+    }
+    const snr = (energy/5) / Math.max(floor/5, total/Math.max(1,m.length), 1e-20);
+    const error = 1200 * Math.log2(fundamental.hz/f0);
+    return {hit: snr >= 3 && fundamental.mag >= .2*strongest
+        && (!solo || Math.max(peak(f0/2).mag,peak(f0/3).mag) <= fundamental.mag)
+        && Math.abs(error) <= (tolerance > 0 ? tolerance : 50),
+        bandEnergy: snr, centsDiff: Math.abs(error), centsError: error};
+}
+
 // Count how many of the expected note's harmonics (k·f0 for the configured
 // ratios) appear as a genuine LOCAL-MAXIMUM spectral peak whose magnitude is at
 // least _ND_HARMONIC_FALLBACK_PEAK_FRAC of the band's peak, within
@@ -2183,12 +2223,14 @@ function _ndScoreChord(buffer, sampleRate, chordNotes, arrangement, stringCount,
             // Bend / slide: pitch is moving, widen the pitch window
             cents = Math.max(cents, 100);
         }
-        if (cn.hm) {
-            // Harmonic: energy-only check (pitch check at fundamental is unreliable)
+        if (cn.hm && !_ndPreciseHarmonic(cn)) {
+            // Legacy harmonic: energy-only check (pitch check at fundamental is unreliable)
             cents = 0;
         }
 
-        const check = _ndConstraintCheckString(
+        const check = _ndPreciseHarmonic(cn)
+            ? _ndCheckNaturalHarmonic(spectrum, totalEnergy, cn, arrangement, stringCount, offsets, capo, pitchCheckCents, chordNotes.length === 1)
+            : _ndConstraintCheckString(
             buffer, sampleRate,
             cn.s, cn.f, arrangement, stringCount, offsets, capo,
             cents, energyThreshold, spectrum, totalEnergy
@@ -5371,7 +5413,7 @@ function createNoteDetector(options = {}) {
             ? performance.now() : Date.now();
         if (detectedMidi >= 0 && detectedConfidence > detectionConfidenceMin) {
             const expectedMidi = _ndMidiFromStringFret(
-                note.s, note.f, currentArrangement, currentStringCount, tuningOffsets, capo
+                note.s, _ndScoringFret(note), currentArrangement, currentStringCount, tuningOffsets, capo
             );
             if (Number.isFinite(expectedMidi)
                 && Math.abs(_ndNearestOctaveCents(detectedMidi, expectedMidi)) <= pitchTolerance) {
@@ -5574,7 +5616,7 @@ function createNoteDetector(options = {}) {
                 stringEnergy[s] = Math.round(_ndBandEnergy(magnitudes, binHz, lo, hi, total) * 1000) / 1000;
             }
             // Charted string's expected pitch + band peak — shared by both checks.
-            const expectedMidi = _ndMidiFromStringFret(chartNote.s, chartNote.f, currentArrangement, currentStringCount, tuningOffsets, capo);
+            const expectedMidi = _ndMidiFromStringFret(chartNote.s, _ndScoringFret(chartNote), currentArrangement, currentStringCount, tuningOffsets, capo);
             const expHz = 440 * Math.pow(2, (expectedMidi - 69) / 12);
             const [loHz, hiHz] = _ndStringBandHz(chartNote.s, currentArrangement, currentStringCount, tuningOffsets, capo);
             const loBin = Math.max(0, Math.floor(loHz / binHz));
@@ -6192,7 +6234,7 @@ function createNoteDetector(options = {}) {
                         notes: _ndSingleNotes.map(cn => ({
                             s: cn.s, f: cn.f,
                             ho: !!cn.ho, po: !!cn.po,
-                            b: !!cn.b, sl: !!cn.sl, hm: !!cn.hm,
+                            b: !!cn.b, sl: !!cn.sl, hm: !!cn.hm, hps: cn.hps,
                         })),
                     };
                     const gen = sessionGen;
@@ -6245,7 +6287,7 @@ function createNoteDetector(options = {}) {
                 if (!r || !r.hit) {
                     try {
                         const expectedMidiSnap = _ndMidiFromStringFret(
-                            cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
+                            cn.s, _ndScoringFret(cn), currentArrangement, currentStringCount, tuningOffsets, capo
                         );
                         _ndVerifyFailSnap.set(key, {
                             noteTime: cn.t,
@@ -6267,7 +6309,7 @@ function createNoteDetector(options = {}) {
                 // the note if none ever does.
                 const pitchError = Number.isFinite(r.centsError) ? r.centsError : null;
                 const expectedMidi = _ndMidiFromStringFret(
-                    cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
+                    cn.s, _ndScoringFret(cn), currentArrangement, currentStringCount, tuningOffsets, capo
                 );
                 const detectedMidiForJudgment = Number.isFinite(pitchError)
                     ? expectedMidi + pitchError / 100
@@ -6332,7 +6374,7 @@ function createNoteDetector(options = {}) {
                         notes: group.map(cn => ({
                             s: cn.s, f: cn.f,
                             ho: !!cn.ho, po: !!cn.po,
-                            b: !!cn.b, sl: !!cn.sl, hm: !!cn.hm,
+                            b: !!cn.b, sl: !!cn.sl, hm: !!cn.hm, hps: cn.hps,
                         })),
                     };
                     const gen = sessionGen;
@@ -6386,7 +6428,7 @@ function createNoteDetector(options = {}) {
 
                 const lead = group[0];
                 const expectedMidi = _ndMidiFromStringFret(
-                    lead.s, lead.f, currentArrangement, currentStringCount, tuningOffsets, capo
+                    lead.s, _ndScoringFret(lead), currentArrangement, currentStringCount, tuningOffsets, capo
                 );
                 // Chord-level late-grace must come from the MAX sus
                 // across constituents — not just `lead.sus` — so that
@@ -6425,10 +6467,10 @@ function createNoteDetector(options = {}) {
                 if (bridgeOnsetPrimed && bridgeNewOnsets.size > 0) {
                     for (const cn of group) {
                         const m = _ndMidiFromStringFret(
-                            cn.s, cn.f, currentArrangement, currentStringCount,
+                            cn.s, _ndScoringFret(cn), currentArrangement, currentStringCount,
                             tuningOffsets, capo
                         );
-                        const o = bridgeNewOnsets.get(m);
+                        const o = bridgeNewOnsets.get(Math.round(m));
                         if (o && (chordFreshOnsetAge === null || o.ageMs < chordFreshOnsetAge)) {
                             chordFreshOnsetAge = o.ageMs;
                         }
@@ -6573,7 +6615,7 @@ function createNoteDetector(options = {}) {
                         // internally consistent (no post-mutation of hit after _ndMakeJudgment
                         // has already computed it from timingState/pitchState).
                         const stringExpectedMidi = _ndMidiFromStringFret(
-                            cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
+                            cn.s, _ndScoringFret(cn), currentArrangement, currentStringCount, tuningOffsets, capo
                         );
                         // Per-string constituent stays as a single-note
                         // judgment (no chord:true flag): _ndMakeJudgment
@@ -6592,7 +6634,7 @@ function createNoteDetector(options = {}) {
                     const stringRes = stringResByKey.get(`${cn.s}_${cn.f}`);
                     const stringHit = stringRes && stringRes.hit;
                     const stringExpectedMidi = _ndMidiFromStringFret(
-                        cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
+                        cn.s, _ndScoringFret(cn), currentArrangement, currentStringCount, tuningOffsets, capo
                     );
                     const stringJudgment = stringHit
                         ? makeMatchedJudgment(
@@ -6668,7 +6710,7 @@ function createNoteDetector(options = {}) {
             const key = noteKey(chartNote, noteTime);
             if (!noteResults.has(key)) {
                 const expectedMidi = _ndMidiFromStringFret(
-                    chartNote.s, chartNote.f, currentArrangement, currentStringCount, tuningOffsets, capo
+                    chartNote.s, _ndScoringFret(chartNote), currentArrangement, currentStringCount, tuningOffsets, capo
                 );
                 // Bass long-window rescue before conceding: re-check the note's
                 // pitch on a 16384-pt window centered on its expected time. A
@@ -6857,7 +6899,7 @@ function createNoteDetector(options = {}) {
                     const key = noteKey({ s: cn.s, f: cn.f }, c.t);
                     if (noteResults.has(key)) continue;
                     const stringMiss = makeMissJudgment(cn, c.t, t, _ndMidiFromStringFret(
-                        cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
+                        cn.s, _ndScoringFret(cn), currentArrangement, currentStringCount, tuningOffsets, capo
                     ));
                     noteResults.set(key, stringMiss);
                     // Bin per-string only when the chord retired as a
@@ -10500,7 +10542,7 @@ function createNoteDetector(options = {}) {
                 po: !!n.po,
                 b: !!n.b,
                 sl: !!n.sl,
-                hm: !!n.hm,
+                hm: !!n.hm, hps: n.hps,
             })),
         };
         try {
@@ -10519,7 +10561,7 @@ function createNoteDetector(options = {}) {
         const r = batch.results[0];
         const flags = {
             ho: !!noteDef.ho, po: !!noteDef.po,
-            b: !!noteDef.b, sl: !!noteDef.sl, hm: !!noteDef.hm,
+            b: !!noteDef.b, sl: !!noteDef.sl, hm: !!noteDef.hm, hps: noteDef.hps,
         };
         const tick = _calLabTickFromResult(r, flags);
         return {
@@ -10540,7 +10582,7 @@ function createNoteDetector(options = {}) {
             const nd = notes[i] || { s: r.s, f: r.f };
             const flags = {
                 ho: !!nd.ho, po: !!nd.po,
-                b: !!nd.b, sl: !!nd.sl, hm: !!nd.hm,
+                b: !!nd.b, sl: !!nd.sl, hm: !!nd.hm, hps: nd.hps,
             };
             return { string: nd.s, fret: nd.f, ..._calLabTickFromResult(r, flags) };
         });
@@ -13703,6 +13745,7 @@ function createNoteDetector(options = {}) {
         const mixNote = (nn) => {
             mix(Math.round((Number.isFinite(nn.t) ? nn.t : 0) * 1000));
             mix(((nn.s | 0) * 100) + (nn.f | 0));
+            mix(_ndPreciseHarmonic(nn) ? nn.hps : -1);
             mix(Math.round((Number.isFinite(nn.sus) ? nn.sus : 0) * 1000));
             mix((nn.ho ? 1 : 0) | (nn.po ? 2 : 0) | (nn.b ? 4 : 0)
                 | (nn.sl ? 8 : 0) | (nn.hm ? 16 : 0) | (nn.mt ? 32 : 0));
@@ -13773,7 +13816,7 @@ function createNoteDetector(options = {}) {
                 s: n.s,
                 f: n.f,
                 sus: Number.isFinite(n.sus) ? n.sus : 0,
-                ho: !!n.ho, po: !!n.po, b: !!n.b, sl: !!n.sl, hm: !!n.hm,
+                ho: !!n.ho, po: !!n.po, b: !!n.b, sl: !!n.sl, hm: !!n.hm, hps: n.hps,
             };
             notes.push(entry);
             byId.set(id, { ...n });
@@ -13792,7 +13835,7 @@ function createNoteDetector(options = {}) {
                     s: cn.s,
                     f: cn.f,
                     sus: Number.isFinite(cn.sus) ? cn.sus : 0,
-                    ho: !!cn.ho, po: !!cn.po, b: !!cn.b, sl: !!cn.sl, hm: !!cn.hm,
+                    ho: !!cn.ho, po: !!cn.po, b: !!cn.b, sl: !!cn.sl, hm: !!cn.hm, hps: cn.hps,
                 };
                 notes.push(entry);
                 byId.set(id, { ...cn, t: c.t });
@@ -13952,7 +13995,7 @@ function createNoteDetector(options = {}) {
                 // ±_ND_LEVEL_WIN_HALF window and trip false misses.
                 if (strikeCtx.silenceWouldTrigger) {
                     const expectedMidiSg = _ndMidiFromStringFret(
-                        cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
+                        cn.s, _ndScoringFret(cn), currentArrangement, currentStringCount, tuningOffsets, capo
                     );
                     _ndLogVerifierRejectOnce('silence:' + v.id, {
                         reason: 'SILENCE_GATE',
@@ -14005,7 +14048,7 @@ function createNoteDetector(options = {}) {
             if (_ndAlreadyCounted(key)) { _ndDrainStats.suppressedRedelivery++; continue; }
 
             const expectedMidi = _ndMidiFromStringFret(
-                cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
+                cn.s, _ndScoringFret(cn), currentArrangement, currentStringCount, tuningOffsets, capo
             );
             if (v.detected) {
                 // detectedSongTime is the playhead the renderer pushed, which
@@ -14020,7 +14063,7 @@ function createNoteDetector(options = {}) {
                 // A bend / slide / harmonic note's pitch deliberately leaves
                 // the chart pitch; widen the pitch gate so the hit rides on
                 // presence + timing, not a moving target.
-                const lenientPitch = !!(cn.b || cn.sl || cn.hm);
+                const lenientPitch = !!(cn.b || cn.sl || (cn.hm && !_ndPreciseHarmonic(cn)));
                 const judgment = makeMatchedJudgment(
                     cn, cn.t, judgedAt, expectedMidi, detectedMidiForJudgment, 1,
                     { pitchError, pitchThresholdCents: lenientPitch ? 600 : undefined }
@@ -14135,7 +14178,7 @@ function createNoteDetector(options = {}) {
         const score = totalStrings > 0 ? hitStrings / totalStrings : 0;
         const lead = _ndVerifierChartById.get(grp.memberIds[0]) || { s: 0, f: 0 };
         const expectedMidi = _ndMidiFromStringFret(
-            lead.s, lead.f, currentArrangement, currentStringCount, tuningOffsets, capo
+            lead.s, _ndScoringFret(lead), currentArrangement, currentStringCount, tuningOffsets, capo
         );
         const lateGraceMs = Math.min((grp.maxSus || 0) * 1000, 1000);
 
@@ -14197,7 +14240,7 @@ function createNoteDetector(options = {}) {
             const mcn = _ndVerifierChartById.get(id);
             if (!mcn) continue;
             const mExpectedMidi = _ndMidiFromStringFret(
-                mcn.s, mcn.f, currentArrangement, currentStringCount, tuningOffsets, capo
+                mcn.s, _ndScoringFret(mcn), currentArrangement, currentStringCount, tuningOffsets, capo
             );
             // The noteResults entry is stamped with the chord-level verdict
             // (so the highway tints every chord gem and the chord frame
@@ -14223,7 +14266,7 @@ function createNoteDetector(options = {}) {
                 // That false-`hit` would then make noteStateFor return
                 // 'miss' for the constituent, undoing the whole point of
                 // stamping it with the chord verdict.
-                const lenientPitch = !!(mcn.b || mcn.sl || mcn.hm);
+                const lenientPitch = !!(mcn.b || mcn.sl || (mcn.hm && !_ndPreciseHarmonic(mcn)));
                 const mDetMidi = Number.isFinite(bestCents)
                     ? mExpectedMidi + bestCents / 100 : null;
                 mJudgment = makeMatchedJudgment(
@@ -14347,7 +14390,7 @@ function createNoteDetector(options = {}) {
                 s: n.s,
                 f: n.f,
                 sus: Number.isFinite(n.sus) ? n.sus : 0,
-                ho: !!n.ho, po: !!n.po, b: !!n.b, sl: !!n.sl, hm: !!n.hm,
+                ho: !!n.ho, po: !!n.po, b: !!n.b, sl: !!n.sl, hm: !!n.hm, hps: n.hps,
             };
             entries.push(entry);
             byId.set(n.id, { ...n });
@@ -18123,7 +18166,7 @@ function createNoteDetector(options = {}) {
                     && Number.isInteger(n.f) && n.f >= 0)
                 .map(n => ({
                     s: n.s, f: n.f,
-                    ho: !!n.ho, po: !!n.po, b: !!n.b, sl: !!n.sl, hm: !!n.hm,
+                    ho: !!n.ho, po: !!n.po, b: !!n.b, sl: !!n.sl, hm: !!n.hm, hps: n.hps,
                 }));
             let cleanNotes = clean.length ? clean : null;
             // A ctx only makes sense alongside a live target.
