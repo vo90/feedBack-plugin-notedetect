@@ -659,9 +659,11 @@ function _ndBarPitch(n, elapsed) {
     return p[p.length-1].v;
 }
 function _ndBarPayload(n, songTime) {
-    return n?.whammy ? {whammy:n.whammy, sus:n.sus,
-        b:!!(n.b || n.bn || n.bnv?.length), sl:typeof n.sl==='number' ? n.sl>=0 : n.sl===true,
+    const contact=n?.harmonic_changes ? {harmonic_changes:n.harmonic_changes,sus:n.sus,
         elapsed:Number.isFinite(songTime) && Number.isFinite(n.t) ? Math.max(0,songTime-n.t) : (n.elapsed || 0)} : {};
+    return {...contact,...(n?.whammy ? {whammy:n.whammy, sus:n.sus,
+        b:!!(n.b || n.bn || n.bnv?.length), sl:typeof n.sl==='number' ? n.sl>=0 : n.sl===true,
+        elapsed:Number.isFinite(songTime) && Number.isFinite(n.t) ? Math.max(0,songTime-n.t) : (n.elapsed || 0)} : {})};
 }
 
 function _ndBarRangeLimitation(n, arrangement, strings, offsets, capo) {
@@ -698,6 +700,37 @@ function _ndFrettedHarmonic(n) {
         && Object.hasOwn(policies,h.kind) && policies[h.kind] === h.policy
         && !n.hm && Number.isInteger(n.f) && n.f >= 0 && n.f <= 48 ? h : null;
 }
+// Strict additive contact contract; detection keeps the original attack target.
+function _ndHarmonicContact(n) {
+    const c=n?.harmonic_changes, e=c?.events?.[0];
+    const keys=(v,k)=>v && typeof v==='object' && !Array.isArray(v) && Object.keys(v).sort().join(',')===k;
+    if(!keys(c,'events,version') || c.version!==1 || !Array.isArray(c.events) || c.events.length!==1
+        || !keys(e,'end,source_id,start,target') || !Number.isFinite(n.sus)
+        || !Number.isFinite(e.start) || !Number.isFinite(e.end) || !(0<e.start && e.start<e.end)
+        || Math.abs(e.end-n.sus)>.0000011 || typeof e.source_id!=='string' || !e.source_id.length || e.source_id.length>512
+        || ['hm','hp','mt','fhm'].some(k=>n[k]) || ['harmonic_target','hn','hps','harmonic_alias'].some(k=>n[k]!==undefined)
+        || e.target?.kind!=='artificial' || !_ndFrettedHarmonic({f:n.f,harmonic_target:e.target})) return null;
+    return e;
+}
+function _ndContactDeadline(n,onset,tolerance,grace=0) {
+    const e=_ndHarmonicContact(n);
+    return Math.min(onset+tolerance+grace,e?onset+e.start:Infinity);
+}
+function _ndContactSustainFret(n,elapsed) {
+    const e=_ndHarmonicContact(n);
+    if(!e || elapsed<e.start-1e-9 || elapsed>e.end+1e-9)return null;
+    let bend=0;const points=n.bnv || [];
+    if(points.length) {
+        bend=points[0].v;
+        for(let i=1;i<points.length;i++) {
+            const a=points[i-1],b=points[i];
+            if(elapsed<b.t) {if(elapsed>a.t)bend=a.v+(b.v-a.v)*(elapsed-a.t)/(b.t-a.t);break;}
+            bend=b.v;
+        }
+    }
+    return n.f+_ndNaturalPitchSemitones(e.target.interval)+bend;
+}
+
 function _ndScoringFret(n, result) {
     if (n?.whammy && Number.isFinite(result?.targetFret)) return result.targetFret;
     const h = _ndFrettedHarmonic(n);
@@ -2336,6 +2369,11 @@ function _ndScoreChord(buffer, sampleRate, chordNotes, arrangement, stringCount,
     const barAlternatives=[];
 
     for (const cn of chordNotes) {
+        if(cn.harmonic_changes !== undefined && (!_ndHarmonicContact(cn)
+            || !Number.isFinite(cn.elapsed) || cn.elapsed>=_ndHarmonicContact(cn).start)) {
+            const r={s:cn.s,f:cn.f,hit:false,bandEnergy:0,centsDiff:null,centsError:null};
+            results.push(r);barAlternatives.push(r);continue;
+        }
         const exclusionReason=_ndBarLimitation(cn) || _ndBarRangeLimitation(cn,arrangement,stringCount,offsets,capo);
         if (exclusionReason) {
             const r={s:cn.s,f:cn.f,hit:false,bandEnergy:0,centsDiff:null,centsError:null,exclusionReason};
@@ -3731,12 +3769,14 @@ function createNoteDetector(options = {}) {
     async function _ndRequireHarmonicTargetSupport(a, notes) {
         const harmonic=(notes || []).some(n=>n?.harmonic_target !== undefined);
         const bar=(notes || []).some(n=>n?.whammy !== undefined);
-        if (!harmonic && !bar) return;
+        const contact=(notes || []).some(n=>n?.harmonic_changes !== undefined);
+        if (!harmonic && !bar && !contact) return;
         if (!_ndHarmonicBridgeVersions.has(a)) _ndHarmonicBridgeVersions.set(a,Promise.all([
             typeof a.harmonicTargetVersion === 'function' ? a.harmonicTargetVersion() : 0,
-            typeof a.whammyVersion === 'function' ? a.whammyVersion() : 0]));
+            typeof a.whammyVersion === 'function' ? a.whammyVersion() : 0,
+            typeof a.harmonicContactVersion === 'function' ? a.harmonicContactVersion() : 0]));
         const versions=await _ndHarmonicBridgeVersions.get(a);
-        if ((harmonic && versions[0] !== 1) || (bar && versions[1] !== 1)) {
+        if ((harmonic && versions[0] !== 1) || (bar && versions[1] !== 1) || (contact && versions[2] !== 1)) {
             _ndHarmonicSupportBlocked = true;
             const message='Scoring paused: these techniques require an updated FeedBack Desktop audio engine.';
             if (!instanceRoot.querySelector('.nd-harmonic-compatibility')) {
@@ -3765,7 +3805,7 @@ function createNoteDetector(options = {}) {
     }
     async function _ndBridgeSetChart(chart) {
         const a = _ndBridgeAudio(); if (!a) return Promise.resolve(null);
-        if (!(chart.notes || []).some(n=>n.harmonic_target !== undefined || n.whammy !== undefined)) {
+        if (!(chart.notes || []).some(n=>n.harmonic_target !== undefined || n.whammy !== undefined || n.harmonic_changes !== undefined)) {
             _ndHarmonicSupportBlocked=false;
             instanceRoot.querySelector('.nd-harmonic-compatibility')?.remove();
         }
@@ -5520,7 +5560,7 @@ function createNoteDetector(options = {}) {
             const susLive = +note.sus || 0;
             if (songTLive >= chartTime - NOTE_LIVE_LEAD
                 && songTLive <= chartTime + susLive + NOTE_LIVE_TAIL
-                && _sustainStillHeld(key, note)) {
+                && _sustainStillHeld(key, note, chartTime, songTLive)) {
                 const a = _ndSustainGlowAlpha();
                 if (a > 0) return { state: 'active', alpha: a, live: true };
             }
@@ -5570,7 +5610,7 @@ function createNoteDetector(options = {}) {
             // ringing on-pitch → hold it lit, brightness tracking the live
             // input level. Below the level threshold, fall through to the
             // post-strike hit fade (the note has decayed / been muted).
-            if (sus > 0.05 && songT < chartTime + sus + 0.05 && _sustainStillHeld(key, note)) {
+            if (sus > 0.05 && songT < chartTime + sus + 0.05 && _sustainStillHeld(key, note, chartTime, songT)) {
                 const a = _ndSustainGlowAlpha();
                 if (a > 0) return { state: 'active', alpha: a, live: true, points, mult, popKey };
             }
@@ -5597,24 +5637,29 @@ function createNoteDetector(options = {}) {
     // TODO(slopsmith#254 follow-up): re-run the constraint chord scorer
     // per audio frame for sustained-and-hit chords so held chords glow
     // the same way held single notes do.
-    function _sustainStillHeld(key, note) {
+    function _sustainStillHeld(key, note, chartTime, songTime) {
         // Feedback is graded only at its initial attack. Its authored trail is
         // visual and must not ask the player to maintain amplifier feedback.
         if (note.whammy || _ndFrettedHarmonic(note)?.policy === 'attack_either') return false;
         const nowMs = (typeof performance !== 'undefined' && performance.now)
             ? performance.now() : Date.now();
+        const elapsed=songTime-chartTime;
+        const contactFret=_ndContactSustainFret(note,elapsed);
+        const phase=contactFret===null ? 0 : 1;
+        const previous=_susActiveUntil.get(key);
+        if(previous && (previous.phase!==phase || elapsed<previous.elapsed))_susActiveUntil.delete(key);
         if (detectedMidi >= 0 && detectedConfidence > detectionConfidenceMin) {
             const expectedMidi = _ndMidiFromStringFret(
-                note.s, _ndScoringFret(note), currentArrangement, currentStringCount, tuningOffsets, capo
+                note.s, contactFret ?? _ndScoringFret(note), currentArrangement, currentStringCount, tuningOffsets, capo
             );
             if (Number.isFinite(expectedMidi)
-                && Math.abs(_ndNearestOctaveCents(detectedMidi, expectedMidi)) <= pitchTolerance) {
-                _susActiveUntil.set(key, nowMs + NOTE_SUS_GRACE_MS);
+                && Math.abs(phase ? (detectedMidi-expectedMidi)*100 : _ndNearestOctaveCents(detectedMidi, expectedMidi)) <= pitchTolerance) {
+                _susActiveUntil.set(key, {until:nowMs+NOTE_SUS_GRACE_MS,phase,elapsed});
                 return true;
             }
         }
         const until = _susActiveUntil.get(key);
-        return Number.isFinite(until) && until > nowMs;
+        return Number.isFinite(until?.until) && until.until > nowMs;
     }
 
     function bsearch(arr, target) {
@@ -5757,6 +5802,9 @@ function createNoteDetector(options = {}) {
             for (const d of (k === 0 ? [0] : [k * STEP, -k * STEP])) {
                 const start = center + d - (_RESCUE_WIN >> 1);
                 if (start < 0 || start + _RESCUE_WIN > _rescueBuf.length) continue;
+                // Never rescue the initial attack using samples after its contact.
+                const contact=_ndHarmonicContact(cn);
+                if(contact && (start+_RESCUE_WIN-center)/sr >= contact.start)continue;
                 const win = _rescueBuf.subarray(start, start + _RESCUE_WIN);
                 _rescueWindows++;
                 const cand = _ndConstraintCheckString(
@@ -6311,7 +6359,8 @@ function createNoteDetector(options = {}) {
                 // and the global cap.
                 const susSec = Number.isFinite(n.sus) && n.sus > 0 ? n.sus : 0;
                 const lateGrace = !n.whammy && susSec > 0 ? Math.min(susSec, MAX_SUS_LATE_GRACE) : 0;
-                if (n.t < t - tolerance - lateGrace) continue;
+                if (n.t < t - tolerance - lateGrace
+                    || (_ndHarmonicContact(n) && t >= _ndContactDeadline(n,n.t,tolerance,lateGrace))) continue;
                 // Spread the chart note so technique flags (ho/po/b/sl/hm)
                 // travel with the candidate. _ndScoreChord reads these to
                 // adjust per-string thresholds, so dropping them here would
@@ -6344,7 +6393,8 @@ function createNoteDetector(options = {}) {
                     if (Number.isFinite(cn.sus) && cn.sus > chordSus) chordSus = cn.sus;
                 }
                 const lateGrace = !(c.notes || []).some(n=>n.whammy) && chordSus > 0 ? Math.min(chordSus, MAX_SUS_LATE_GRACE) : 0;
-                if (c.t < t - tolerance - lateGrace) continue;
+                if (c.t < t - tolerance - lateGrace
+                    || (c.notes || []).some(n=>_ndHarmonicContact(n) && t >= _ndContactDeadline(n,c.t,tolerance,lateGrace))) continue;
                 for (const cn of (c.notes || [])) {
                     if (_ndExcludeTarget(cn)) continue;
                     // Chord constituent notes don't carry their own time —
@@ -6903,7 +6953,7 @@ function createNoteDetector(options = {}) {
             // Effective retire threshold: a sus note isn't retired
             // until its sustain envelope has clearly elapsed, giving
             // matchNotes the same grace period to lock on.
-            if (noteTime > missDeadline - lateGrace) return;
+            if (t <= _ndContactDeadline(chartNote,noteTime,tolerance*2,lateGrace)) return;
             const key = noteKey(chartNote, noteTime);
             if (!noteResults.has(key)) {
                 const expectedMidi = _ndMidiFromStringFret(
@@ -7003,7 +7053,7 @@ function createNoteDetector(options = {}) {
                 // wants late-grace in ms, but the retire-window comparisons
                 // above use seconds.
                 const chordLateGraceMs = chordLateGrace * 1000;
-                if (c.t > missDeadline - chordLateGrace) continue;
+                if (t <= Math.min(...liveNotes.map(n=>_ndContactDeadline(n,c.t,tolerance*2,chordLateGrace)))) continue;
                 // Multi-note chord: judge as a single unit. matchNotes()
                 // stores a judgment object at `<t>_chord` when the chord
                 // cleared the ratio threshold; if that key is present, the
