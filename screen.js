@@ -1,3 +1,11 @@
+// Shared output presentation reference; capture/detection age remains an
+// independent physical duration. No timer or input buffering is introduced.
+function _ndPresentationTime(hw, inputAgeSeconds = 0) {
+    if (typeof hw?.getPresentationTime === 'function') return hw.getPresentationTime(inputAgeSeconds * 1000);
+    return (hw?.getTime?.() || 0) + (hw?.getAvOffset?.() || 0) / 1000 - inputAgeSeconds;
+}
+function _ndTimingRate(hw) { return hw?.getTimingRate?.() || 1; }
+
 // Note Detection plugin
 //
 // Factory pattern — `createNoteDetector(options)` returns an independent
@@ -2926,6 +2934,27 @@ function createNoteDetector(options = {}) {
     // and pointing users at the calibrate workflow is the right
     // trade-off.
     let latencyOffset = 0.080;
+    let inputCalibrationKey = null, inputCalibrationValue = null, inputCalibrationBusy = null, inputCalibrationReadAt = -Infinity, inputCalibrationPersistent = true;
+    async function refreshInputCalibration() {
+        const api = _ndBridgeAudio();
+        // Additional capture sources retain their existing per-source engine
+        // correction; the primary endpoint profile must not be applied to them.
+        if ((sourceId != null && sourceId !== 0) || typeof api?.getCalibration !== 'function') return;
+        if (inputCalibrationBusy) return inputCalibrationBusy;
+        if (performance.now() - inputCalibrationReadAt < 1000) return;
+        inputCalibrationReadAt = performance.now();
+        const channel = selectedChannel === 'left' ? 0 : selectedChannel === 'right' ? 1 : -1;
+        inputCalibrationBusy = api.getCalibration(undefined, channel, latencyOffset * 1000).then(profile => {
+            if (profile?.input && profile.input.key !== inputCalibrationKey) {
+                inputCalibrationKey = profile.input.key;
+                inputCalibrationPersistent = profile.input.persistent !== false;
+                inputCalibrationValue = profile.input.offsetMs;
+                latencyOffset = profile.input.offsetMs / 1000;
+            }
+        }).catch(error => console.warn('[note_detect] Input calibration unavailable:', error))
+            .finally(() => { inputCalibrationBusy = null; });
+        return inputCalibrationBusy;
+    }
     // Fraction of a chord's strings that must register energy for the
     // chord to count as a hit (0.0–1.0). Was 0.6 historically, but
     // harness measurements against real-guitar recordings showed
@@ -3805,6 +3834,7 @@ function createNoteDetector(options = {}) {
     }
     async function _ndBridgeSetChart(chart) {
         const a = _ndBridgeAudio(); if (!a) return Promise.resolve(null);
+        await refreshInputCalibration();
         if (!(chart.notes || []).some(n=>n.harmonic_target !== undefined || n.whammy !== undefined || n.harmonic_changes !== undefined)) {
             _ndHarmonicSupportBlocked=false;
             instanceRoot.querySelector('.nd-harmonic-compatibility')?.remove();
@@ -3816,12 +3846,14 @@ function createNoteDetector(options = {}) {
             return a.setChart(chart);
         return Promise.resolve(null);
     }
-    function _ndBridgeGetVerdicts(songTime, playing, playbackRate = _hostGetSpeed()) {
+    async function _ndBridgeGetVerdicts(songTime, playing, playbackRate = _hostGetSpeed()) {
         const a = _ndBridgeAudio(); if (!a) return Promise.resolve(null);
+        await refreshInputCalibration();
+        const timing = hw?.getJudgmentTiming?.(latencyOffset * 1000) ?? null;
         if (sourceId != null && typeof a.getSourceNoteVerdicts === 'function')
-            return a.getSourceNoteVerdicts(sourceId, songTime, playing, playbackRate);
+            return a.getSourceNoteVerdicts(sourceId, songTime, playing, playbackRate, timing);
         if (sourceId == null && typeof a.getNoteVerdicts === 'function')
-            return a.getNoteVerdicts(songTime, playing, playbackRate);
+            return a.getNoteVerdicts(songTime, playing, playbackRate, timing);
         return Promise.resolve(null);
     }
     // Post-gate raw YIN (sustain glow): prefer getRawPitch; fall back to the
@@ -4114,6 +4146,13 @@ function createNoteDetector(options = {}) {
 
     // ── Settings persistence (only the default singleton writes) ──────
     function saveSettings() {
+        const calibrationApi = _ndBridgeAudio();
+        if (inputCalibrationPersistent && inputCalibrationKey && inputCalibrationValue !== latencyOffset * 1000 && calibrationApi?.saveCalibration) {
+            const value = latencyOffset * 1000, key = inputCalibrationKey;
+            void calibrationApi.saveCalibration('input', key, value).then(ok => {
+                if (ok && key === inputCalibrationKey) inputCalibrationValue = value;
+            }).catch(error => console.warn('[note_detect] Input calibration save failed:', error));
+        }
         if (!isDefault) return;
         try {
             localStorage.setItem(_ND_STORAGE_KEY, JSON.stringify({
@@ -5188,7 +5227,7 @@ function createNoteDetector(options = {}) {
                 // Clear the buffer on any backward jump.
                 if (hw && typeof hw.getTime === 'function') {
                     const avO = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
-                    const songT = hw.getTime() + avO;
+                    const songT = _ndPresentationTime(hw);
                     const last = _ndLevelSamples.length
                         ? _ndLevelSamples[_ndLevelSamples.length - 1].songT
                         : -Infinity;
@@ -5340,7 +5379,7 @@ function createNoteDetector(options = {}) {
             const remain = keep - fromBuf;
             if (remain > 0) nb.set(_rescueBuf.subarray(_rescueBuf.length - remain), 0);
             _rescueBuf = nb;
-            if (hw && hw.getTime) _rescueBufEndT = hw.getTime();
+            if (hw && hw.getTime) _rescueBufEndT = _ndPresentationTime(hw);
         }
         // Record the per-frame input level into the level-history time series so
         // the silence gate ("was the player silent here") works on the BROWSER
@@ -5355,7 +5394,7 @@ function createNoteDetector(options = {}) {
             for (let i = 0; i < buffer.length; i++) sum += buffer[i] * buffer[i];
             const lvl = Math.min(1, Math.max(0, Math.sqrt(sum / buffer.length) * 5));
             const avO = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
-            const songT = hw.getTime() + avO;
+            const songT = _ndPresentationTime(hw);
             const last = _ndLevelSamples.length ? _ndLevelSamples[_ndLevelSamples.length - 1].songT : -Infinity;
             if (songT < last - 0.05) _ndLevelSamples.length = 0;   // seek / drill-wrap → reset
             _ndLevelSamples.push({ songT, level: lvl });
@@ -5555,8 +5594,7 @@ function createNoteDetector(options = {}) {
             // long sustain whose engine verdict lands after the gem is culled)
             // lights immediately. Only while the note straddles the strike line
             // AND the live detector hears its pitch (see NOTE_LIVE_LEAD above).
-            const songTLive = ((hw && hw.getTime) ? hw.getTime() : 0)
-                + ((hw && hw.getAvOffset) ? hw.getAvOffset() / 1000 : 0);
+            const songTLive = _ndPresentationTime(hw);
             const susLive = +note.sus || 0;
             if (songTLive >= chartTime - NOTE_LIVE_LEAD
                 && songTLive <= chartTime + susLive + NOTE_LIVE_TAIL
@@ -5575,8 +5613,7 @@ function createNoteDetector(options = {}) {
         // matchNotes/checkMisses); applying it here would start the
         // post-hit fade ~latencyOffset (default 80 ms) before the gem
         // visually arrived, shortening the visible glow window.
-        const songT = ((hw && hw.getTime) ? hw.getTime() : 0)
-            + ((hw && hw.getAvOffset) ? hw.getAvOffset() / 1000 : 0);
+        const songT = _ndPresentationTime(hw);
 
         // Anchor the post-strike glow / miss-wash age on when the verdict
         // landed (_ndDisplayFrom, stamped in recordJudgment), not the note's
@@ -5782,8 +5819,8 @@ function createNoteDetector(options = {}) {
         const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
         // The note's audio sits at hw time = noteTime - avOffset + latency
         // (inverse of the match clock t = hwTime + avOffset - latency).
-        const noteHwTime = noteTime - avOffsetSec + latencyOffset;
-        const samplesBack = Math.round((_rescueBufEndT - noteHwTime) * sr);
+        const noteHwTime = noteTime + latencyOffset * _ndTimingRate(hw);
+        const samplesBack = Math.round((_rescueBufEndT - noteHwTime) * sr / _ndTimingRate(hw));
         const center = _rescueBuf.length - samplesBack;
         // Scan CENTER-OUTWARD (0, +STEP, -STEP, …) and take the first hit; on a
         // repeated note center-outward prefers the on-time instance. ±160 ms in
@@ -5840,8 +5877,8 @@ function createNoteDetector(options = {}) {
         const sr = audioCtx ? audioCtx.sampleRate : bridgeSampleRate;
         if (!(sr > 0)) return blank;
         const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
-        const noteHwTime = noteTime - avOffsetSec + latencyOffset;
-        const samplesBack = Math.round((_rescueBufEndT - noteHwTime) * sr);
+        const noteHwTime = noteTime + latencyOffset * _ndTimingRate(hw);
+        const samplesBack = Math.round((_rescueBufEndT - noteHwTime) * sr / _ndTimingRate(hw));
         const center = _rescueBuf.length - samplesBack;
         const start = center - (_RESCUE_WIN >> 1);
         if (start < 0 || start + _RESCUE_WIN > _rescueBuf.length) return blank;
@@ -5882,7 +5919,7 @@ function createNoteDetector(options = {}) {
     // audio time maps to visual time + latencyOffset. true/false, or null if no
     // level telemetry covers the window.
     function _wasSilentAtNote(noteTime) {
-        return _ndIsSilentWindow(_ndLevelSamples, noteTime + latencyOffset, _ND_LEVEL_WIN_HALF, _ND_SILENCE_THRESHOLD);
+        return _ndIsSilentWindow(_ndLevelSamples, noteTime + latencyOffset * _ndTimingRate(hw), _ND_LEVEL_WIN_HALF, _ND_SILENCE_THRESHOLD);
     }
 
     function makeMissJudgment(cn, noteTime, t, expectedMidi, extra = {}) {
@@ -6123,8 +6160,7 @@ function createNoteDetector(options = {}) {
         // before the verdict even exists. Browser-path judgments are
         // recorded near chart time, so this is effectively a no-op there.
         if (judgment && !Number.isFinite(judgment._ndDisplayFrom)) {
-            judgment._ndDisplayFrom = ((hw && hw.getTime) ? hw.getTime() : 0)
-                + ((hw && hw.getAvOffset) ? hw.getAvOffset() / 1000 : 0);
+            judgment._ndDisplayFrom = _ndPresentationTime(hw);
         }
         noteResults.set(key, judgment);
         if (count) {
@@ -6294,7 +6330,7 @@ function createNoteDetector(options = {}) {
     async function matchNotes(frameBuffer) {
         if (_ndHarmonicSupportBlocked) return;
         const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
-        const t = hw.getTime() + avOffsetSec - latencyOffset;
+        const t = _ndPresentationTime(hw, latencyOffset);
         // A/V auto-calibration tap (browser + desktop-yin/ml paths). The
         // engine-verifier path returns before matchNotes(), so it taps
         // _calLogDetection() directly — see the poll loop.
@@ -6723,7 +6759,7 @@ function createNoteDetector(options = {}) {
                     }
                 }
                 const tChord = (chordFreshOnsetAge != null)
-                    ? hw.getTime() + avOffsetSec - (chordFreshOnsetAge / 1000)
+                    ? _ndPresentationTime(hw, chordFreshOnsetAge / 1000)
                     : t;
 
                 const chordJudgment = makeMatchedJudgment(
@@ -6912,7 +6948,7 @@ function createNoteDetector(options = {}) {
         // misses this tick retire as plain misses instead of running FFTs.
         let rescueWinBudget = _RESCUE_WINDOWS_PER_TICK;
         const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
-        const t = hw.getTime() + avOffsetSec - latencyOffset;
+        const t = _ndPresentationTime(hw, latencyOffset);
         const tolerance = timingTolerance;
         // Backward seek / restart: the playhead jumped back, so the user is
         // replaying a section (flubbed the intro, backed up, played it clean) or
@@ -7206,7 +7242,7 @@ function createNoteDetector(options = {}) {
                 silenceWouldTrigger: false,
             };
         }
-        const cnCenterVisualT = noteTimeAudio + latencyOffset;
+        const cnCenterVisualT = noteTimeAudio + latencyOffset * _ndTimingRate(hw);
         let peakL = 0;
         let inWindow = 0;
         for (let i = _ndLevelSamples.length - 1; i >= 0; i--) {
@@ -7540,8 +7576,7 @@ function createNoteDetector(options = {}) {
         }
         const currentHw = resolveHw();
         if (lastChordScore !== null && currentHw && typeof currentHw.getTime === 'function') {
-            const songTime = currentHw.getTime() - latencyOffset
-                + (currentHw.getAvOffset ? currentHw.getAvOffset() / 1000 : 0);
+            const songTime = _ndPresentationTime(currentHw, latencyOffset);
             if (songTime - lastChordTime <= 1.5) {
                 const pct = Math.round(lastChordScore * 100);
                 return `Chord ${lastChordHit}/${lastChordTotal} strings (${pct}%)`;
@@ -11843,7 +11878,7 @@ function createNoteDetector(options = {}) {
                 <option value="crepe" ${detectionMethod === 'crepe' ? 'selected' : ''}>CREPE/SPICE (robust, ~20MB model)</option>
             </select>
 
-            <label class="block text-gray-400 text-xs mb-1">Audio Latency Offset: <span class="nd-latency-val">${Math.round(latencyOffset * 1000)}</span>ms</label>
+            <label class="block text-gray-400 text-xs mb-1">Input / detection correction: <span class="nd-latency-val">${Math.round(latencyOffset * 1000)}</span>ms</label>
             <input type="range" min="0" max="250" value="${Math.round(latencyOffset * 1000)}"
                    class="nd-latency-slider w-full accent-green-400 mb-2">
             <div class="text-[10px] text-gray-600 mb-3 leading-tight">
@@ -12533,8 +12568,7 @@ function createNoteDetector(options = {}) {
                 // show it for a short TTL after the chord's chart time
                 // so the readout doesn't linger forever through silence
                 // / noise between notes.
-                const songTime = (hw.getTime ? hw.getTime() : 0) - latencyOffset
-                    + (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
+                const songTime = _ndPresentationTime(hw, latencyOffset);
                 const CHORD_HUD_TTL_SEC = 1.5;
                 if (songTime - lastChordTime <= CHORD_HUD_TTL_SEC) {
                     const pct = Math.round(lastChordScore * 100);
@@ -12594,7 +12628,7 @@ function createNoteDetector(options = {}) {
         if (hw.isDefaultRenderer && !hw.isDefaultRenderer()) return;
 
         const t = hw.getTime();
-        const renderT = t + (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
+        const renderT = _ndPresentationTime(hw);
         const notes = _ndChartNotes();
         const chords = _ndChartChords();
 
@@ -14169,7 +14203,7 @@ function createNoteDetector(options = {}) {
         // Push the same corrected clock the legacy matchNotes() path judges
         // against — hw.getTime() + avOffset - latencyOffset.
         const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
-        const playheadAudio = (hw.getTime ? hw.getTime() : 0) + avOffsetSec - latencyOffset;
+        const playheadAudio = _ndPresentationTime(hw, latencyOffset);
         const playing = !!(window.slopsmith && window.slopsmith.isPlaying);
 
         // A backward jump (drill A-B loop wrap or a manual seek-back): the
@@ -14242,7 +14276,7 @@ function createNoteDetector(options = {}) {
                 // detection pipeline uses to align audio to chart. So
                 // visual time = audio/chart time + latencyOffset. To
                 // find level samples that match this note's chart time,
-                // center the search at `cn.t + latencyOffset` in visual
+                // center the search at `cn.t + latencyOffset * _ndTimingRate(hw)` in visual
                 // time; otherwise the configured user latency (up to
                 // 250 ms) would push the real peak outside the
                 // ±_ND_LEVEL_WIN_HALF window and trip false misses.
@@ -14355,7 +14389,7 @@ function createNoteDetector(options = {}) {
             } else {
                 // Engine finalized the note as a miss — its timing window
                 // has fully passed. Mirror the legacy checkMisses() retire.
-                const t = (hw.getTime ? hw.getTime() : 0) + avOffsetSec - latencyOffset;
+                const t = _ndPresentationTime(hw, latencyOffset);
                 if (!_ndRejectDedup.has('silence:' + key)) {
                     let timingErrorMs = null;
                     if (Number.isFinite(v.timingErrorMs)) timingErrorMs = v.timingErrorMs;
@@ -14451,7 +14485,7 @@ function createNoteDetector(options = {}) {
             // _ndMakeJudgment's timing classification to give the same
             // result as the legacy browser/desktop chord-miss path.
             const avOffsetSecMiss = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
-            const missJudgedAt = (hw.getTime ? hw.getTime() : 0) + avOffsetSecMiss - latencyOffset;
+            const missJudgedAt = _ndPresentationTime(hw, latencyOffset);
             _ndLogVerifierRejectOnce(chordKey, {
                 reason: 'CHORD_RATIO_FAIL',
                 noteTime: grp.t,
@@ -14486,8 +14520,8 @@ function createNoteDetector(options = {}) {
         // _recordPerStringForChord, bypassing recordJudgment so the chord
         // isn't double-counted in HUD totals.)
         const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
-        const nowSongT = (hw.getTime ? hw.getTime() : 0) + avOffsetSec;
-        const missAt = nowSongT - latencyOffset;
+        const nowSongT = _ndPresentationTime(hw);
+        const missAt = _ndPresentationTime(hw, latencyOffset);
         for (const id of grp.memberIds) {
             if (noteResults.has(id)) continue;
             const mcn = _ndVerifierChartById.get(id);
@@ -15407,6 +15441,7 @@ function createNoteDetector(options = {}) {
     }
 
     async function enableImpl() {
+        await refreshInputCalibration();
         // Resolve the highway lazily — supports plugin load orders
         // where highway isn't defined at factory construction. If
         // it's still missing, there's nothing to hook into, so bail
@@ -16915,7 +16950,8 @@ function createNoteDetector(options = {}) {
     // before matchNotes() and so must tap this directly.
     function _calLogDetection() {
         if (autoCalibrate && isDefault && detectedMidi >= 0 && _calDetections.length < _CAL_MAX) {
-            _calDetections.push({ bt: hw.getTime() - latencyOffset, m: detectedMidi });
+            const av = (hw.getAvOffset?.() || 0) / 1000;
+            _calDetections.push({ bt: _ndPresentationTime(hw, latencyOffset) - av * _ndTimingRate(hw), m: detectedMidi });
         }
     }
     function _ndRunAutoCalibrate() {
@@ -16938,6 +16974,7 @@ function createNoteDetector(options = {}) {
         _calDoneThisPlay = true;
         _lastAvCalibration = r;
         try {
+            r.offsetMs /= _ndTimingRate(hw);
             window.setAvOffsetMs(r.offsetMs);
             console.log(`[note_detect] A/V auto-calibrated to ${r.offsetMs} ms (${r.matched}/${r.total} notes matched)`);
             // Dispatch on the normal detector event path (window + instanceRoot),
