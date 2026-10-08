@@ -16975,14 +16975,20 @@ function createNoteDetector(options = {}) {
         _lastAvCalibration = r;
         try {
             r.offsetMs /= _ndTimingRate(hw);
-            window.setAvOffsetMs(r.offsetMs);
-            console.log(`[note_detect] A/V auto-calibrated to ${r.offsetMs} ms (${r.matched}/${r.total} notes matched)`);
+            // Performance timing cannot identify output delay independently.
+            // Offer a suggestion without overwriting manual/guided calibration.
+            r.suggested = true;
+            const audioApi = window.feedBackDesktop?.audio;
+            if (audioApi?.getCalibration) void audioApi.getCalibration().then(profile => {
+                if (_lastAvCalibration === r) r.outputProfile = profile?.output;
+            }).catch(() => {});
+            console.log(`[note_detect] A/V suggestion ${r.offsetMs} ms (${r.matched}/${r.total} notes matched)`);
             // Dispatch on the normal detector event path (window + instanceRoot),
             // matching notedetect:verify/notedetect:session, so consumers that
             // don't listen on the slopsmith bus still receive it.
-            dispatchInstanceEvent('notedetect:calibrated', { offsetMs: r.offsetMs, matched: r.matched, total: r.total });
+            dispatchInstanceEvent('notedetect:calibration-suggested', { offsetMs: r.offsetMs, matched: r.matched, total: r.total });
             if (window.slopsmith && typeof window.slopsmith.emit === 'function') {
-                window.slopsmith.emit('notedetect:calibrated', { offsetMs: r.offsetMs, matched: r.matched, total: r.total });
+                window.slopsmith.emit('notedetect:calibration-suggested', { offsetMs: r.offsetMs, matched: r.matched, total: r.total });
             }
         } catch (e) { return 'setAvOffsetMs threw: ' + (e && e.message || e); }
         return 'OK ' + JSON.stringify(r);
@@ -18761,6 +18767,17 @@ function createNoteDetector(options = {}) {
             saveSettings();
         },
         getLastCalibration: () => _lastAvCalibration,
+        applyLastCalibration: async () => {
+            const r = _lastAvCalibration, api = window.feedBackDesktop?.audio;
+            if (!r?.suggested || !r.outputProfile || window._guidedAvCalibration || !api?.getCalibration) return false;
+            const current = (await api.getCalibration())?.output;
+            if (!current || current.key !== r.outputProfile.key || current.routeKey !== r.outputProfile.routeKey
+                || current.offsetMs !== r.outputProfile.offsetMs) return false;
+            if (!await api.saveCalibration('output', current.key, r.offsetMs)) return false;
+            window.setAvOffsetMs(r.offsetMs, true);
+            r.suggested = false;
+            return true;
+        },
         // Debug hooks: detection-log state + a manual calibrate trigger, so a
         // headless run can see whether the log fills and why calibrate no-ops.
         _calDebug: () => ({ detections: _calDetections.length, subscribed: _calSubscribed, autoCalibrate, isDefault, notes: (hw && hw.getNotes) ? (hw.getNotes() || []).length : -1 }),

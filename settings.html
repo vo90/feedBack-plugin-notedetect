@@ -169,12 +169,15 @@
             <input type="checkbox" id="nd-auto-calibrate"
                    class="mt-0.5 rounded border-gray-600 bg-dark-700 text-accent focus:ring-accent/40">
             <span class="text-sm text-gray-300">
-                Auto-calibrate A/V offset
+                Suggest A/V alignment after playing
                 <span class="block text-[11px] text-gray-500 leading-relaxed mt-1">
-                    On by default. After each play, picks the audio/video offset that matches the most chart notes and applies it automatically — no hand-setting the A/V slider. One play is usually enough to converge.
+                    Estimates an offset from your playing. Suggestions never change your saved calibration. For a guided comparison, open Audio → Calibrate audio/video.
                 </span>
             </span>
         </label>
+        <div class="mt-3 text-xs text-gray-400"><span id="nd-av-suggestion">No suggestion yet.</span>
+            <button id="nd-av-apply-suggestion" type="button" class="ml-2 px-3 py-1 rounded bg-gray-700 text-gray-200" disabled>Apply suggestion</button>
+        </div>
     </div>
 
     <!-- Tuning-mode toggle. Lives here (where the panels it gates also
@@ -814,6 +817,18 @@
         const autoCalCb = _q('nd-auto-calibrate');
         if (autoCalCb && autoCalCb.checked !== autoCal) autoCalCb.checked = autoCal;
         if (autoCalCb) autoCalCb.disabled = !nd;
+        const suggestion = nd?.getLastCalibration?.();
+        const suggestionText = _q('nd-av-suggestion'), suggestionButton = _q('nd-av-apply-suggestion');
+        if (suggestionText) suggestionText.textContent = suggestion
+            ? `Playing-based suggestion: ${Math.round(suggestion.offsetMs)} ms. This may include playing and chart timing.` : 'No suggestion yet.';
+        if (suggestionButton) {
+            suggestionButton.disabled = !suggestion?.suggested || !suggestion.outputProfile || !!window._guidedAvCalibration;
+            suggestionButton.onclick = async () => {
+                suggestionButton.disabled = true;
+                try { if (!await nd.applyLastCalibration()) suggestionText.textContent = 'Output or calibration changed. Play again for a new suggestion.'; }
+                catch (_) { suggestionText.textContent = 'Could not save the suggestion.'; }
+            };
+        }
 
         // Scoring HUD skin select — value sourced from the plugin so it
         // stays in sync if another surface (or another tab) switched it.
