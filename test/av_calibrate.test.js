@@ -11,6 +11,21 @@ const { loadDetectionCore } = require('./_loader');
 // real Gasoline / Why'd-You-Only-Call data (s=1 f=5 -> expected 38).
 function bassGeom() { return { arrangement: 'bass', stringCount: 4, offsets: [0, 0, 0, 0], capo: 0 }; }
 
+test('a successful playing-based estimate never writes the AV calibration automatically', () => {
+    let writes = 0;
+    const core = loadDetectionCore({sandboxBeforeRun: sandbox => {
+        sandbox.setAvOffsetMs = () => {writes++;};
+        sandbox.highway.getNotes = () => Array.from({length:20}, (_,i)=>({t:i,s:0,f:0}));
+    }});
+    const detector = core.createNoteDetector({isDefault:true});
+    detector._calSeedForTest(20);
+    const result = detector._runAutoCalibrate();
+    assert.match(result, /^OK /);
+    assert.equal(detector.getLastCalibration().suggested, true);
+    assert.equal(writes, 0);
+    detector.destroy();
+});
+
 test('recovers a known +60 ms A/V offset from offset-free detections', () => {
     const core = loadDetectionCore();
     const trueMs = 60, off = trueMs / 1000;
