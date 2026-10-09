@@ -49,6 +49,57 @@ async function _ndScanInputChannels(audio, { cancelled = () => false,
 
 // Shared output presentation reference; capture/detection age remains an
 // independent physical duration. No timer or input buffering is introduced.
+// Raw selected-channel measurements are independent of rig/input gain and the
+// long-lived UI peak hold. Never change the device or gain while measuring.
+function _ndInputMeasurementKey(s) {
+    return JSON.stringify([s?.generation, s?.selected, s?.channels?.map(c => [c.index, c.name])]);
+}
+async function _ndCaptureSelectedInput(audio, { kind, noisePeak = 0, expectedIdentity, cancelled = () => false,
+    wait = ms => new Promise(resolve => setTimeout(resolve, ms)), onProgress = () => {} } = {}) {
+    const initial = await audio.getInputChannelSnapshot();
+    if (!initial?.running || initial.selected < 0 || !initial.channels?.some(c => c.index === initial.selected))
+        throw new Error('Choose an individual input channel before measuring its level.');
+    const identity = _ndInputMeasurementKey(initial);
+    if (expectedIdentity && identity !== expectedIdentity)
+        throw new Error('The input changed. Measure background noise and playing level again.');
+    const threshold = Math.max(0.003, noisePeak * 3);
+    let sequence = initial.sequence, stalled = 0, active = 0, listening = kind === 'noise';
+    const samples = [];
+    let attack = [];
+    for (let i = 0; i < 200; ++i) {
+        if (cancelled()) throw new Error('Measurement cancelled.');
+        await wait(80);
+        const s = await audio.getInputChannelSnapshot();
+        if (cancelled()) throw new Error('Measurement cancelled.');
+        if (!s?.running || _ndInputMeasurementKey(s) !== identity)
+            throw new Error('The input changed. Measure background noise and playing level again.');
+        if (s.sequence === sequence) {
+            if (++stalled >= 6) throw new Error('Input readings stopped. Check the device and retry.');
+            continue;
+        }
+        sequence = s.sequence; stalled = 0;
+        const peak = s.channels.find(c => c.index === s.selected).peak;
+        if (!Number.isFinite(peak) || peak < 0) throw new Error('Invalid input level. Retry the measurement.');
+        if (!listening) {
+            active = peak >= threshold ? active + 1 : 0;
+            if (active) attack.push({ level: peak * 100, peak: peak * 100 });
+            else attack = [];
+            if (active >= 3) {
+                listening = true;
+                samples.push(...attack.slice(0, -1)); // Preserve the first attack peak.
+            }
+        }
+        if (listening) samples.push({ level: peak * 100, peak: peak * 100 });
+        onProgress({ listening, peak, count: samples.length });
+        if (samples.length >= 20) return { samples, identity };
+    }
+    throw new Error('No clear playing signal captured. Play when prompted, or adjust input gain below.');
+}
+function _ndGainForRawPeak(peak) {
+    if (!Number.isFinite(peak) || peak < 0.003) return null;
+    return +Math.max(0.1, Math.min(5, 0.25 / peak)).toFixed(2);
+}
+
 function _ndPresentationTime(hw, inputAgeSeconds = 0) {
     if (typeof hw?.getPresentationTime === 'function') return hw.getPresentationTime(inputAgeSeconds * 1000);
     return (hw?.getTime?.() || 0) + (hw?.getAvOffset?.() || 0) / 1000 - inputAgeSeconds;
@@ -7527,7 +7578,7 @@ function createNoteDetector(options = {}) {
 
     function _calWizardSignalStatusDisplay(status) {
         if (status === 'good') return 'Good — strong enough for detection';
-        if (status === 'too_low') return 'Too low — play louder or raise input gain';
+        if (status === 'too_low') return 'Quiet signal — check input gain';
         if (status === 'too_hot') return 'Too hot — risk of clipping; lower input gain';
         return status || '—';
     }
@@ -7822,12 +7873,12 @@ function createNoteDetector(options = {}) {
         if (!(Number.isFinite(measuredAtGain) && measuredAtGain > 0)) return null;
         const measGain = measuredAtGain;
         const rawPeak = (Number.isFinite(signalPeakPct) ? signalPeakPct / 100 : 0) / measGain;
-        if (rawPeak < 0.02) return null;   // no real signal captured — don't recommend
-        const target = Math.max(0.1, Math.min(5, CAL_TARGET_PEAK / rawPeak));
+        const target = _ndGainForRawPeak(rawPeak);
+        if (target == null) return null;
         const pct = Math.round(rawPeak * 100);
         return {
             value: +target.toFixed(2),
-            reason: `Hardest playing peaked at ~${pct}% of full scale — set input to ${target.toFixed(2)}× so it lands near −12 dBFS (keeps the amps clean and matches other instruments).`,
+            reason: `Captured playing peaked at ~${pct}% of full scale. Suggested gain: ${target.toFixed(2)}× (target −12 dBFS, maximum 5×). Check with strong strums before saving.`,
         };
     }
 
@@ -7853,6 +7904,10 @@ function createNoteDetector(options = {}) {
                 rec.inputGain = g.value;
                 rec.reasons.inputGain = g.reason;
             }
+        }
+        if (Number.isFinite(wiz?.gainDraft)) {
+            rec.inputGain = wiz.gainDraft;
+            rec.reasons.inputGain = 'Input gain chosen in the Signal Level step.';
         }
         const med = wiz && wiz.timing && Number.isFinite(wiz.timing.medianMs)
             ? wiz.timing.medianMs
@@ -7939,7 +7994,7 @@ function createNoteDetector(options = {}) {
             sum += s.level;
             if (s.peak > maxPeak) maxPeak = s.peak;
         }
-        const avg = Math.round(sum / samples.length);
+        const avg = +(sum / samples.length).toFixed(3);
         const peak = maxPeak;
         if (kind === 'noise') {
             wiz.noise = {
@@ -7971,7 +8026,8 @@ function createNoteDetector(options = {}) {
             // engine sits at a safe level instead of hot at unity. (No-op without a
             // recommendation, e.g. no signal captured; the host still re-asserts its
             // preset gain on the next tone load.)
-            if (gRec && wiz._onEnginePath) _ndSetEngineGain(gRec.value);
+            if (gRec && wiz._onEnginePath && !wiz.rawSignalIdentity) _ndSetEngineGain(gRec.value);
+            if (gRec && wiz.rawSignalIdentity) wiz.gainDraft = gRec.value;
             _calWizardSetAutoStatus(
                 `<span class="text-green-300/90">Captured:</span> avg ${avg}% · peak ${peak}% · <span class="font-semibold">${label}</span>${extra}`);
             _calWizardBuildSafeRecommendations(wiz, getCalibrationSnapshot());
@@ -8036,12 +8092,106 @@ function createNoteDetector(options = {}) {
             _calWizardSetAutoStatus('<span class="text-amber-200/90">Turn Detect on first.</span>');
             return;
         }
+        if (_calWizardStartRawCapture(wiz, 'noise')) return;
         _calWizardBeginCountdownThen('noise', 3, () => {
             _calWizardSetAutoStatus('<span class="text-cyan-300/90">Listening…</span> Mute all strings.');
             _calWizardRunLevelSampler(wiz, 'noise', 1600, (samples) => {
                 _calWizardFinishLevelSample(wiz, 'noise', samples);
             });
         });
+    }
+
+    function _calWizardHasRawInput(wiz) {
+        return (sourceId == null || sourceId === 0) && wiz?.channelSnapshot?.selected >= 0
+            && typeof _ndResolveAudioBridge()?.getInputChannelSnapshot === 'function';
+    }
+
+    function _calWizardStartRawCapture(wiz, kind) {
+        if (!_calWizardHasRawInput(wiz)) return false;
+        const audio = _ndResolveAudioBridge();
+        _calWizardBeginCountdownThen(kind, 3, async () => {
+            _calWizardStopAutoCapture();
+            const token = { kind, phase: 'raw' };
+            wiz.autoCapture = token;
+            const cancelled = () => _calWizardState !== wiz || wiz.autoCapture !== token;
+            try {
+                const s = await audio.getInputChannelSnapshot();
+                if (cancelled()) return;
+                if (kind === 'signal' && wiz.rawNoiseIdentity !== _ndInputMeasurementKey(s))
+                    throw new Error('Go back and capture background noise for this input first.');
+                const result = await _ndCaptureSelectedInput(audio, {
+                    kind, noisePeak: kind === 'signal' ? wiz.noise.peakPct / 100 : 0,
+                    expectedIdentity: _ndInputMeasurementKey(s), cancelled,
+                    onProgress: ({ listening, peak, count }) => {
+                        const instruction = kind === 'noise' ? 'KEEP STRINGS MUTED'
+                            : listening ? 'KEEP PLAYING' : 'PLAY NOW — strum at your normal playing strength';
+                        _calWizardSetAutoStatus(`<strong class="text-cyan-300">${instruction}</strong><br>`
+                            + `Raw peak ${(peak * 100).toFixed(2)}%${listening ? ` · ${Math.round(count / 20 * 100)}% captured` : ''}`);
+                    },
+                });
+                if (cancelled()) return;
+                _calWizardStopAutoCapture();
+                if (kind === 'noise') wiz.rawNoiseIdentity = result.identity;
+                else {
+                    wiz.rawSignalIdentity = result.identity;
+                    wiz._onEnginePath = true;
+                    wiz._measuredAtGain = 1; // Raw pre-gain meter, not a forced engine gain.
+                }
+                _calWizardFinishLevelSample(wiz, kind, result.samples);
+            } catch (e) {
+                if (!cancelled()) {
+                    _calWizardStopAutoCapture();
+                    _calWizardSetAutoStatus(`<span class="text-amber-200">${_ndEscapeHtml(e.message)}</span>`);
+                }
+            }
+        });
+        return true;
+    }
+
+    async function _calWizardRefreshGainPreview() {
+        const wiz = _calWizardState;
+        if (!wiz || wiz.step !== 4 || !_calWizardHasRawInput(wiz) || wiz.gainReadPending) return;
+        wiz.gainReadPending = true;
+        try {
+            const s = await _ndResolveAudioBridge().getInputChannelSnapshot();
+            if (_calWizardState !== wiz || wiz.step !== 4) return;
+            const el = _calWizardEl?.querySelector('.nd-cal-gain-preview');
+            const valid = s?.running && _ndInputMeasurementKey(s) === _ndInputMeasurementKey(wiz.channelSnapshot);
+            const apply = _calWizardEl?.querySelector('.nd-cal-save-gain');
+            if (apply) apply.disabled = !valid || !!wiz.autoCapture || !!wiz.gainSaving;
+            if (!valid) { if (el) el.textContent = 'Input changed — return to Audio Input and confirm the channel.'; return; }
+            const peak = s.channels.find(c => c.index === s.selected)?.peak || 0;
+            const live = _calWizardEl?.querySelector('.nd-cal-live-level');
+            if (live) live.textContent = `Live input ${s.selected + 1}: ${(peak * 100).toFixed(2)}% raw`;
+            const gain = wiz.gainDraft ?? engineInputGain ?? inputGain;
+            const adjusted = peak * gain;
+            if (el) el.textContent = `Raw ${(peak * 100).toFixed(2)}% → preview ${(adjusted * 100).toFixed(1)}%`
+                + (adjusted >= 1 ? ' · Clipping — lower gain' : adjusted > 0.85 ? ' · Little headroom — lower gain' : '');
+        } catch (_) { /* retry on next wizard tick */ }
+        finally { wiz.gainReadPending = false; }
+    }
+
+    async function _calWizardSaveGain(wiz) {
+        if (_calWizardState !== wiz || wiz.autoCapture || wiz.gainSaving) return;
+        wiz.gainSaving = true;
+        try {
+            const audio = _ndResolveAudioBridge();
+            const s = await audio.getInputChannelSnapshot();
+            if (_calWizardState !== wiz) return;
+            if (!s?.running || _ndInputMeasurementKey(s) !== _ndInputMeasurementKey(wiz.channelSnapshot))
+                throw new Error('Input changed — confirm the channel before applying gain.');
+            const gain = Math.max(0.1, Math.min(5, wiz.gainDraft ?? engineInputGain ?? inputGain));
+            await audio.setGain('input', gain);
+            engineInputGain = inputGain = gain;
+            if (gainNode) gainNode.gain.value = gain;
+            saveSettings();
+            wiz.gainDraft = gain;
+            wiz.gainSaved = true;
+            _calWizardBuildSafeRecommendations(wiz, getCalibrationSnapshot());
+            if (_calWizardState === wiz) renderCalibrationWizard();
+        } catch (e) {
+            _calWizardSetAutoStatus(`<span class="text-amber-200">${_ndEscapeHtml(e.message)}</span>`);
+        } finally { wiz.gainSaving = false; }
     }
 
     function _calWizardStartSignalCapture() {
@@ -8052,8 +8202,9 @@ function createNoteDetector(options = {}) {
             _calWizardSetAutoStatus('<span class="text-amber-200/90">Turn Detect on first.</span>');
             return;
         }
-        const noiseFloor = (wiz.noise && wiz.noise.avgPct) || 3;
-        const trigger = noiseFloor + 8;
+        if (_calWizardStartRawCapture(wiz, 'signal')) return;
+        const noiseFloor = (wiz.noise && wiz.noise.avgPct) || 0;
+        const trigger = Math.max(0.3, noiseFloor * 3);
         // Measure at UNITY engine gain so the captured peak is the RAW input (the
         // engine meter is post-gain). Record whether we're on the desktop engine
         // path so a *failed* unity-set isn't mis-measured against the web gain
@@ -8073,7 +8224,7 @@ function createNoteDetector(options = {}) {
             wiz.autoCapture = { kind: 'signal', phase: 'wait_signal', samples, started };
             const tick = () => {
                 const s = getCalibrationSnapshot();
-                const lvl = s.inputLevelPct;
+                const lvl = s.inputLevelRawPct ?? s.inputLevelPct;
                 const elapsed = Date.now() - started;
                 if (lvl >= trigger && wiz.autoCapture.phase === 'wait_signal') {
                     wiz.autoCapture.phase = 'listening';
@@ -8081,7 +8232,7 @@ function createNoteDetector(options = {}) {
                     _calWizardSetAutoStatus('<span class="text-cyan-300/90">Signal detected — listening…</span> Play open low E.');
                 }
                 if (wiz.autoCapture.phase === 'listening') {
-                    samples.push({ level: lvl, peak: s.inputPeakPct, t: Date.now() });
+                    samples.push({ level: lvl, peak: lvl, t: Date.now() });
                     const listenFor = Date.now() - (wiz.autoCapture.signalStarted || started);
                     _calWizardSetAutoStatus(
                         `<span class="text-cyan-300/90">Listening…</span> ${Math.round(listenFor / 1000)}s · `
@@ -9035,6 +9186,7 @@ function createNoteDetector(options = {}) {
         return {
             enabled: !!enabled,
             inputLevelPct: Math.round((inputLevel || 0) * 100),
+            inputLevelRawPct: (inputLevel || 0) * 100,
             inputPeakPct: Math.round((inputPeak || 0) * 100),
             hearingLine,
             heardNote,
@@ -9114,7 +9266,8 @@ function createNoteDetector(options = {}) {
         const snap = getCalibrationSnapshot();
         const wiz = _calWizardState;
         const live = _calWizardEl.querySelector('.nd-cal-live-level');
-        if (live) live.textContent = 'Live: ' + calibrationFormatLevel(snap.inputLevelPct, snap.inputPeakPct);
+        if (live && !(wiz.step === 4 && _calWizardHasRawInput(wiz)))
+            live.textContent = 'Live: ' + calibrationFormatLevel(snap.inputLevelPct, snap.inputPeakPct);
         const heard = _calWizardEl.querySelector('.nd-cal-heard');
         if (heard) {
             if (wiz.step === 5) {
@@ -9361,13 +9514,21 @@ function createNoteDetector(options = {}) {
             const sDone = wiz.signal && wiz.signal.captured;
             html = `
                 ${_calWizardDetectBanner(snap)}
-                <p class="text-gray-300 text-xs mb-2">Play your <strong class="text-gray-200">open low E</strong> at normal playing volume when prompted. Listening starts after the countdown.</p>
+                <p class="text-gray-300 text-xs mb-2">When prompted, strum firmly at your normal playing strength. Keep playing until capture finishes.</p>
                 <div class="nd-cal-live-level text-cyan-300/90 text-xs font-mono mb-2">Live: —</div>
                 <div class="nd-cal-auto-status text-[11px] text-gray-400 mb-2 h-[2.75rem] overflow-y-auto">${sDone
                     ? `Captured: avg ${wiz.signal.avgPct}% · peak ${wiz.signal.peakPct}% · ${_calWizardSignalStatusDisplay(wiz.signal.status)}`
                     : 'Ready to measure your playing level.'}</div>
                 <button type="button" class="nd-cal-start-signal w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mb-1">${sDone ? 'Retry Signal Capture' : 'Start Signal Capture'}</button>
-                <p class="text-[10px] text-gray-500">If <strong>Too low</strong>: raise interface gain or play closer to the mic/DI. If <strong>Too hot</strong>: lower gain to avoid clipping.</p>`;
+                ${_calWizardHasRawInput(wiz) ? `
+                <div class="mt-3 pt-3 border-t border-gray-600">
+                    <label class="block text-gray-200 text-xs mb-2" for="nd-cal-input-gain">Game input gain: <strong class="nd-cal-gain-value">${_calWizardFmtGain(wiz.gainDraft ?? engineInputGain ?? inputGain)}</strong></label>
+                    <input id="nd-cal-input-gain" class="nd-cal-input-gain w-full" type="range" min="0.1" max="5" step="0.01" value="${wiz.gainDraft ?? engineInputGain ?? inputGain}">
+                    <p class="nd-cal-gain-preview text-xs text-cyan-300 my-2" role="status">Reading input…</p>
+                    <p class="text-xs text-gray-400 mb-2">Preview the level while playing. Applies to note detection and in-game guitar effects. Leave headroom for your strongest strums.</p>
+                    <button type="button" class="nd-cal-save-gain w-full py-2 bg-accent rounded-lg text-xs font-semibold text-white">Apply and save gain</button>
+                    ${wiz.gainSaved ? '<p class="text-xs text-green-300 mt-2">Input gain saved.</p>' : ''}
+                </div>` : '<p class="text-[10px] text-gray-500">For a quiet signal, adjust input gain. If clipping, lower gain. On desktop, choose an individual channel in Audio Input to preview and save game gain here.</p>'}`;
         } else if (step === 5) {
             const noteSpecs = _calWizardResolveNoteChecks({ mode: 'quick' });
             // Standalone (no song): let the player pick their instrument so the
@@ -9512,6 +9673,17 @@ function createNoteDetector(options = {}) {
 
         const startSignal = body.querySelector('.nd-cal-start-signal');
         if (startSignal) startSignal.onclick = () => _calWizardStartSignalCapture();
+
+        const gainSlider = body.querySelector('.nd-cal-input-gain');
+        if (gainSlider) gainSlider.oninput = () => {
+            wiz.gainDraft = Math.max(0.1, Math.min(5, Number(gainSlider.value)));
+            wiz.gainSaved = false;
+            body.querySelector('.nd-cal-gain-value').textContent = _calWizardFmtGain(wiz.gainDraft);
+            _calWizardBuildSafeRecommendations(wiz, getCalibrationSnapshot());
+            _calWizardRefreshGainPreview();
+        };
+        const saveGain = body.querySelector('.nd-cal-save-gain');
+        if (saveGain) saveGain.onclick = () => _calWizardSaveGain(wiz);
 
         const autoChannel = body.querySelector('.nd-cal-auto-channel');
         if (autoChannel) {
@@ -9747,6 +9919,7 @@ function createNoteDetector(options = {}) {
                 && _calWizardState.step >= 1 && _calWizardState.step <= 6) {
                 _calWizardRefreshLive();
                 if (_calWizardState.step === 1) _calWizardRefreshChannels();
+                if (_calWizardState.step === 4) _calWizardRefreshGainPreview();
             }
         }, 200);
     }
