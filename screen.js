@@ -1,3 +1,52 @@
+// Input setup is deliberately separate from pitch detection and scoring.
+function _ndInputChannelLabel(channel) {
+    const number = `Input ${channel.index + 1}`;
+    return channel.name ? `${number} — ${channel.name}` : number;
+}
+
+async function _ndScanInputChannels(audio, { cancelled = () => false,
+    wait = ms => new Promise(resolve => setTimeout(resolve, ms)), onPhase = () => {} } = {}) {
+    if (!audio?.getInputChannelSnapshot) throw new Error('Update the desktop audio engine to search all input channels.');
+    const initial = await audio.getInputChannelSnapshot();
+    if (!initial?.running || !initial.channels?.length) throw new Error('No active input channels. Select and start your audio input first.');
+    const key = snapshot => JSON.stringify(snapshot.channels.map(c => [c.index, c.name]));
+    const identity = key(initial);
+    const samples = initial.channels.map(c => ({ ...c, noise: 0, peak: 0, activeSamples: 0 }));
+    let sequence = initial.sequence, stalled = 0;
+    async function sample(phase, count) {
+        for (let i = 0; i < count; ++i) {
+            if (cancelled()) throw new Error('Channel search cancelled.');
+            await wait(100);
+            if (cancelled()) throw new Error('Channel search cancelled.');
+            const s = await audio.getInputChannelSnapshot();
+            if (cancelled()) throw new Error('Channel search cancelled.');
+            if (!s?.running || s.generation !== initial.generation || s.selected !== initial.selected || key(s) !== identity)
+                throw new Error('The input changed. Search again using the current device.');
+            if (s.sequence === sequence) {
+                if (++stalled >= 5) throw new Error('No fresh input signal is arriving. Check the audio device and try again.');
+                continue;
+            }
+            stalled = 0; sequence = s.sequence;
+            samples.forEach((c, index) => {
+                const peak = s.channels[index].peak;
+                if (!Number.isFinite(peak) || peak < 0) return;
+                if (phase === 'quiet') c.noise = Math.max(c.noise, peak);
+                if (phase === 'play') {
+                    c.peak = Math.max(c.peak, peak);
+                    if (peak >= Math.max(0.003, c.noise * 3)) ++c.activeSamples;
+                }
+            });
+        }
+    }
+    onPhase('Mute your strings. Measuring background noise…');
+    await sample('settle', 15);
+    await sample('quiet', 15);
+    onPhase('Play several notes or strum now…');
+    await sample('play', 40);
+    const candidates = samples.filter(c => c.activeSamples >= 3);
+    return { snapshot: initial, samples, candidates };
+}
+
 // Shared output presentation reference; capture/detection age remains an
 // independent physical duration. No timer or input buffering is introduced.
 function _ndPresentationTime(hw, inputAgeSeconds = 0) {
@@ -7676,16 +7725,6 @@ function createNoteDetector(options = {}) {
         return s;
     }
 
-    const _CAL_WIZARD_CHANNEL_PROBE_MS = 3000;
-    const _CAL_WIZARD_CHANNEL_PROBE_INTERVAL_MS = 100;
-    const _CAL_WIZARD_CHANNEL_PROBE_SETTLE_MS = 250;
-    const _CAL_WIZARD_CHANNEL_PROBE_MIN_PEAK = 0.05;
-    const _CAL_WIZARD_CHANNEL_PROBE_MONO_TIE_RATIO = 0.10;
-    const _CAL_WIZARD_INPUT_CHANNEL_OPTIONS = [
-        { ch: -1, label: 'Default / Mono Mix' },
-        { ch: 0, label: 'Input 1 / Ch 1' },
-        { ch: 1, label: 'Input 2 / Ch 2' },
-    ];
     const _CAL_WIZARD_TIMED_PLAYALONG_SEC = 30;
     const _CAL_WIZARD_PLAY_ALONG_WAIT_MS = 60000;
     const _CAL_WIZARD_PLAY_ALONG_WAIT_POLL_MS = 250;
@@ -8868,25 +8907,10 @@ function createNoteDetector(options = {}) {
     }
 
     function _calWizardDeviceLabel() {
+        const device = _calWizardState?.channelSnapshot;
+        if (device?.deviceName) return `${device.deviceName} (${device.deviceType})`;
         if (!selectedDeviceId) return 'Default system input';
         return `Device ${selectedDeviceId.slice(0, 12)}…`;
-    }
-
-    function _calWizardEngineChannelLabel(ch) {
-        const opt = _CAL_WIZARD_INPUT_CHANNEL_OPTIONS.find((o) => o.ch === ch);
-        return opt ? opt.label : `Channel ${ch}`;
-    }
-
-    function _calWizardEngineChannelDisplayLabel(ch) {
-        if (ch === 0) return 'Left (Ch 1)';
-        if (ch === 1) return 'Right (Ch 2)';
-        return 'Default / Mono Mix';
-    }
-
-    function _calWizardPluginChannelFromEngine(ch) {
-        if (ch === 0) return 'left';
-        if (ch === 1) return 'right';
-        return 'mono';
     }
 
     function _calWizardSleep(ms) {
@@ -8894,290 +8918,101 @@ function createNoteDetector(options = {}) {
     }
 
     function _calWizardWizardAudioApi() {
+        // This setup configures the primary device. An additional detector
+        // must never silently change another player's primary input.
+        if (sourceId != null && sourceId !== 0) return null;
         if (usingDesktopBridge && bridgeDesktop && bridgeDesktop.audio) return bridgeDesktop.audio;
-        const desktop = (typeof window !== 'undefined') ? window.feedBackDesktop : null;
-        return (desktop && desktop.audio) ? desktop.audio : null;
+        return window.feedBackDesktop?.audio || null;
     }
 
-    async function _calWizardSampleEngineLevels(durationMs, intervalMs) {
+    async function _calWizardRefreshChannels() {
+        const wiz = _calWizardState;
+        if (!wiz || wiz.step !== 1 || wiz.channelProbeRunning || wiz.channelReadBusy) return;
         const audio = _calWizardWizardAudioApi();
-        if (!audio || typeof audio.getLevels !== 'function') {
-            return { maxLevel: 0, avgLevel: 0, maxPeak: 0 };
-        }
-        let maxLevel = 0;
-        let maxPeak = 0;
-        let levelSum = 0;
-        let levelCount = 0;
-        const t0 = Date.now();
-        while (Date.now() - t0 < durationMs) {
-            try {
-                const lv = await audio.getLevels();
-                if (lv) {
-                    const level = Number.isFinite(lv.inputLevel) ? lv.inputLevel : 0;
-                    const peak = Number.isFinite(lv.inputPeak) ? lv.inputPeak : 0;
-                    maxLevel = Math.max(maxLevel, level);
-                    maxPeak = Math.max(maxPeak, peak);
-                    levelSum += level;
-                    levelCount++;
-                }
-            } catch (_) { /* read-only */ }
-            await _calWizardSleep(intervalMs);
-        }
-        const avgLevel = levelCount > 0 ? levelSum / levelCount : 0;
-        return { maxLevel, avgLevel, maxPeak };
-    }
-
-    function _calWizardChannelProbeTrialShortLabel(t) {
-        if (!t) return '?';
-        if (t.ch === -1) return 'Mono';
-        if (t.ch === 0) return 'Ch 1';
-        if (t.ch === 1) return 'Ch 2';
-        return t.label || '?';
-    }
-
-    function _calWizardChannelProbeProgressLabel(ch) {
-        if (ch === -1) return 'Mono Mix';
-        if (ch === 0) return 'Ch 1';
-        if (ch === 1) return 'Ch 2';
-        return 'Channel';
-    }
-
-    function _calWizardChannelProbeTrialsSummary(trials) {
-        if (!trials || !trials.length) return '';
-        return trials.map((t) => `${_calWizardChannelProbeTrialShortLabel(t)} ${Math.round((t.maxLevel || 0) * 100)}%`).join(', ');
-    }
-
-    function _calWizardLevelsClose(a, b, ratio) {
-        const hi = Math.max(a, b);
-        if (hi <= 0) return true;
-        return Math.abs(a - b) / hi <= ratio;
-    }
-
-    function _calWizardTrialByCh(trials, ch) {
-        return trials.find((t) => t.ch === ch) || null;
-    }
-
-    function _calWizardPickChannelProbeWinner(trials) {
-        if (!trials || !trials.length) return null;
-        let best = trials[0];
-        for (let i = 1; i < trials.length; i++) {
-            const t = trials[i];
-            if (t.maxLevel > best.maxLevel
-                || (t.maxLevel === best.maxLevel && t.avgLevel > best.avgLevel)) {
-                best = t;
+        if (!audio?.getInputChannelSnapshot) return;
+        wiz.channelReadBusy = true;
+        try {
+            const snapshot = await audio.getInputChannelSnapshot();
+            if (_calWizardState !== wiz || wiz.step !== 1 || wiz.channelProbeRunning) return;
+            if (!snapshot?.running || !snapshot.channels?.length) throw new Error('Select and start an audio input to see its channels.');
+            const previous = wiz.channelSnapshot;
+            const changed = !previous || previous.generation !== snapshot.generation || previous.selected !== snapshot.selected;
+            wiz.channelSnapshot = snapshot;
+            if (changed) {
+                wiz.channelChoice = snapshot.selected;
+                wiz.channelProbeResult = null;
+                wiz.channelProbeError = previous ? 'Input changed. Check the selected channel or search again.' : null;
+                renderCalibrationWizard();
             }
-        }
-        const mono = trials.find((t) => t.ch === -1);
-        if (!mono || best.ch !== -1) return best;
-        let bestSingle = null;
-        for (const t of trials) {
-            if (t.ch !== 0 && t.ch !== 1) continue;
-            if (!bestSingle || t.maxLevel > bestSingle.maxLevel
-                || (t.maxLevel === bestSingle.maxLevel && t.avgLevel > bestSingle.avgLevel)) {
-                bestSingle = t;
+            _calWizardEl?.querySelectorAll('[data-channel-level]').forEach(el => {
+                const ch = snapshot.channels.find(c => c.index === Number(el.getAttribute('data-channel-level')));
+                if (ch) el.textContent = ch.peak > 0 ? `${Math.round(20 * Math.log10(ch.peak))} dBFS` : 'Silent';
+            });
+        } catch (e) {
+            if (_calWizardState === wiz && wiz.step === 1 && !wiz.channelProbeRunning) {
+                const message = e.message || String(e);
+                const changed = !!wiz.channelSnapshot || wiz.channelProbeError !== message;
+                wiz.channelSnapshot = null;
+                wiz.channelProbeResult = null;
+                wiz.channelProbeError = message;
+                if (changed) renderCalibrationWizard();
             }
-        }
-        if (!bestSingle) return best;
-        const hi = Math.max(mono.maxLevel, bestSingle.maxLevel);
-        if (hi > 0 && Math.abs(mono.maxLevel - bestSingle.maxLevel) / hi <= _CAL_WIZARD_CHANNEL_PROBE_MONO_TIE_RATIO) {
-            return bestSingle;
-        }
-        return best;
-    }
-
-    function _calWizardAnalyzeChannelProbeTrials(trials) {
-        const ratio = _CAL_WIZARD_CHANNEL_PROBE_MONO_TIE_RATIO;
-        const ch1 = _calWizardTrialByCh(trials, 0);
-        const ch2 = _calWizardTrialByCh(trials, 1);
-        const best = _calWizardPickChannelProbeWinner(trials);
-        const ch1ch2Close = !!(ch1 && ch2
-            && _calWizardLevelsClose(ch1.maxLevel, ch2.maxLevel, ratio));
-        const ch1usable = !!(ch1 && ch1.maxLevel >= _CAL_WIZARD_CHANNEL_PROBE_MIN_PEAK);
-        const ch2usable = !!(ch2 && ch2.maxLevel >= _CAL_WIZARD_CHANNEL_PROBE_MIN_PEAK);
-        const ambiguousCh12 = ch1ch2Close && ch1usable && ch2usable;
-        let suggested = ch2;
-        let alternate = ch1;
-        if (ch1 && ch2) {
-            if (ch2.maxLevel > ch1.maxLevel) {
-                suggested = ch2;
-                alternate = ch1;
-            } else if (ch1.maxLevel > ch2.maxLevel) {
-                suggested = ch1;
-                alternate = ch2;
-            } else if (ch2.avgLevel > ch1.avgLevel) {
-                suggested = ch2;
-                alternate = ch1;
-            } else if (ch1.avgLevel > ch2.avgLevel) {
-                suggested = ch1;
-                alternate = ch2;
-            } else {
-                // Exact tie — default suggestion to Ch 2 (Spark LIVE guitar path).
-                suggested = ch2;
-                alternate = ch1;
-            }
-        }
-        return {
-            best,
-            ch1,
-            ch2,
-            ch1ch2Close,
-            ambiguousCh12,
-            suggested,
-            alternate,
-        };
-    }
-
-    async function _calWizardApplyEngineInputChannel(ch) {
-        const audio = _calWizardWizardAudioApi();
-        if (!audio || typeof audio.setInputChannel !== 'function') return false;
-        await audio.setInputChannel(ch);
-        if (typeof audio.loadDeviceSettings === 'function'
-            && typeof audio.saveDeviceSettings === 'function') {
-            try {
-                const cur = await audio.loadDeviceSettings();
-                const base = (cur && typeof cur === 'object') ? cur : {};
-                await audio.saveDeviceSettings({
-                    ...base,
-                    inputChannel: String(ch),
-                    savedAt: Date.now(),
-                });
-            } catch (e) {
-                console.warn('[note_detect] cal wizard saveDeviceSettings:', e);
-            }
-        }
-        selectedChannel = _calWizardPluginChannelFromEngine(ch);
-        saveSettings();
-        return true;
-    }
-
-    function _calWizardFormatChannelProbeResult(result) {
-        const summary = (result && result.trials) ? _calWizardChannelProbeTrialsSummary(result.trials) : '';
-        if (!result || result.ok === false) {
-            return `<span class="text-amber-200/90">No strong input detected.</span> Check guitar volume, cable, Spark USB routing, input gain, or try another device.${summary ? `<div class="text-gray-500 mt-1">${summary}</div>` : ''}`;
-        }
-        if (result.ok === 'ambiguous') {
-            const sug = Number.isFinite(result.suggestedCh)
-                ? _calWizardEngineChannelDisplayLabel(result.suggestedCh)
-                : '—';
-            const alt = Number.isFinite(result.alternateCh)
-                ? _calWizardEngineChannelDisplayLabel(result.alternateCh)
-                : '—';
-            return `<span class="text-amber-200/90">Ch 1 and Ch 2 are very close.</span> Suggested: ${sug}, but ${alt} is also usable. Choose the channel that matches your setup.${summary ? `<div class="text-gray-500 mt-1">${summary}</div>` : ''}`;
-        }
-        const levelPct = Math.round((result.bestLevel || 0) * 100);
-        const peakPct = Math.round((result.bestPeak || 0) * 100);
-        const disp = Number.isFinite(result.bestCh)
-            ? _calWizardEngineChannelDisplayLabel(result.bestCh)
-            : (result.bestLabel || '—');
-        const peakNote = peakPct > levelPct ? ` (peak ${peakPct}%)` : '';
-        return `<span class="text-green-300/90">Best channel: ${disp}, level ${levelPct}%${peakNote}</span>${summary ? `<div class="text-gray-500 mt-1">${summary}</div>` : ''}`;
+        } finally { wiz.channelReadBusy = false; }
     }
 
     async function _calWizardApplyChannelProbeUserPick(ch) {
         const wiz = _calWizardState;
-        if (!wiz || !Number.isFinite(ch)) return;
-        const applied = await _calWizardApplyEngineInputChannel(ch);
-        if (!applied) return;
-        const trial = wiz.channelProbeResult && wiz.channelProbeResult.trials
-            ? _calWizardTrialByCh(wiz.channelProbeResult.trials, ch)
-            : null;
-        wiz.channelProbeResult = {
-            ok: true,
-            userPicked: true,
-            bestCh: ch,
-            bestLabel: trial ? trial.label : _calWizardEngineChannelLabel(ch),
-            bestLevel: trial ? trial.maxLevel : 0,
-            bestPeak: trial ? trial.maxPeak : 0,
-            trials: wiz.channelProbeResult.trials,
-        };
+        const snapshot = wiz?.channelSnapshot;
+        const audio = _calWizardWizardAudioApi();
+        if (!wiz || wiz.channelProbeRunning || !snapshot || !audio?.confirmInputChannel) return;
+        if (!Number.isInteger(ch) || (ch !== -1 && !snapshot.channels.some(c => c.index === ch))) return;
+        wiz.channelProbeRunning = true;
+        wiz.channelProbeError = null;
         renderCalibrationWizard();
-        _calWizardRefreshLive();
+        try {
+            const result = await audio.confirmInputChannel(ch, snapshot.generation, snapshot.selected);
+            if (_calWizardState !== wiz) return;
+            if (!result?.ok) throw new Error(result?.error || 'Could not select the input channel.');
+            wiz.channelSnapshot = { ...snapshot, selected: ch };
+            wiz.channelChoice = ch;
+            wiz.channelProbeResult = { applied: true };
+            // Browser left/right/mono selection is independent; do not coerce
+            // a desktop channel above 2 into the browser's mono setting.
+            await refreshInputCalibration();
+        } catch (e) {
+            if (_calWizardState === wiz) wiz.channelProbeError = e.message || String(e);
+        } finally {
+            wiz.channelProbeRunning = false;
+            if (_calWizardState === wiz) renderCalibrationWizard();
+        }
     }
 
     async function _calWizardAutoDetectInputChannel() {
         const wiz = _calWizardState;
-        if (!wiz) return;
-        if (wiz.channelProbeRunning) {
-            _calWizardSetChannelProbeStatus(
-                '<span class="text-amber-200/90">Detection already in progress...</span>');
-            return;
-        }
-        const snap = getCalibrationSnapshot();
-        if (!snap.enabled) {
-            wiz.channelProbeError = 'Turn Detect on first.';
-            renderCalibrationWizard();
-            return;
-        }
-        const audio = _calWizardWizardAudioApi();
-        if (!usingDesktopBridge || !audio
-            || typeof audio.setInputChannel !== 'function'
-            || typeof audio.getLevels !== 'function') {
-            wiz.channelProbeError = 'Auto-detect needs the desktop audio engine.';
-            renderCalibrationWizard();
-            return;
-        }
+        if (!wiz || wiz.channelProbeRunning) return;
         wiz.channelProbeRunning = true;
-        wiz.channelProbeError = null;
         wiz.channelProbeResult = null;
+        wiz.channelProbeError = null;
         const token = {};
         wiz.channelProbeAbort = token;
         renderCalibrationWizard();
-        const trials = [];
-        const probeSteps = _CAL_WIZARD_INPUT_CHANNEL_OPTIONS;
         try {
-            for (let i = 0; i < probeSteps.length; i++) {
-                const opt = probeSteps[i];
-                if (wiz.channelProbeAbort !== token) return;
-                const progLabel = _calWizardChannelProbeProgressLabel(opt.ch);
-                _calWizardSetChannelProbeStatus(
-                    `<span class="text-cyan-300/90">Strum hard…</span> Testing <strong>${progLabel} (${i + 1} of ${probeSteps.length})</strong>…`);
-                await audio.setInputChannel(opt.ch);
-                if (typeof audio.resetPeaks === 'function') await audio.resetPeaks();
-                await _calWizardSleep(_CAL_WIZARD_CHANNEL_PROBE_SETTLE_MS);
-                const { maxLevel, avgLevel, maxPeak } = await _calWizardSampleEngineLevels(
-                    _CAL_WIZARD_CHANNEL_PROBE_MS,
-                    _CAL_WIZARD_CHANNEL_PROBE_INTERVAL_MS,
-                );
-                if (wiz.channelProbeAbort !== token) return;
-                trials.push({ ch: opt.ch, label: opt.label, maxLevel, avgLevel, maxPeak });
-            }
-            const analysis = _calWizardAnalyzeChannelProbeTrials(trials);
-            const { best, ambiguousCh12, suggested, alternate } = analysis;
-            const ok = best && best.maxLevel >= _CAL_WIZARD_CHANNEL_PROBE_MIN_PEAK;
-            if (!ok) {
-                wiz.channelProbeResult = {
-                    ok: false,
-                    trials,
-                    bestLevel: best ? best.maxLevel : 0,
-                    bestPeak: best ? best.maxPeak : 0,
-                };
-            } else if (ambiguousCh12) {
-                wiz.channelProbeResult = {
-                    ok: 'ambiguous',
-                    ambiguousCh12: true,
-                    suggestedCh: suggested ? suggested.ch : null,
-                    alternateCh: alternate ? alternate.ch : null,
-                    trials,
-                };
-            } else {
-                await _calWizardApplyEngineInputChannel(best.ch);
-                wiz.channelProbeResult = {
-                    ok: true,
-                    clearWinner: true,
-                    bestCh: best.ch,
-                    bestLabel: best.label,
-                    bestLevel: best.maxLevel,
-                    bestPeak: best.maxPeak,
-                    trials,
-                };
-            }
+            const result = await _ndScanInputChannels(_calWizardWizardAudioApi(), {
+                cancelled: () => _calWizardState !== wiz || wiz.step !== 1 || wiz.channelProbeAbort !== token,
+                onPhase: message => _calWizardSetChannelProbeStatus(_ndEscapeHtml(message)),
+            });
+            if (_calWizardState !== wiz || wiz.channelProbeAbort !== token) return;
+            wiz.channelSnapshot = result.snapshot;
+            wiz.channelProbeResult = result;
+            if (result.candidates.length === 1) wiz.channelChoice = result.candidates[0].index;
         } catch (e) {
-            wiz.channelProbeError = (e && e.message) ? e.message : String(e);
+            if (_calWizardState === wiz && wiz.channelProbeAbort === token) wiz.channelProbeError = e.message || String(e);
         } finally {
-            if (wiz.channelProbeAbort === token) wiz.channelProbeAbort = null;
-            wiz.channelProbeRunning = false;
-            renderCalibrationWizard();
-            _calWizardRefreshLive();
+            if (wiz.channelProbeAbort === token) {
+                wiz.channelProbeAbort = null;
+                wiz.channelProbeRunning = false;
+                if (_calWizardState === wiz) renderCalibrationWizard();
+            }
         }
     }
 
@@ -9447,6 +9282,8 @@ function createNoteDetector(options = {}) {
         title.textContent = `Calibration Wizard — ${meta.title}`;
         if (backBtn) backBtn.style.visibility = step > 0 && step < 8 ? 'visible' : 'hidden';
         if (nextBtn) {
+            nextBtn.disabled = step === 1 && (wiz.channelProbeRunning || (!!wiz.channelSnapshot
+                && wiz.channelChoice !== wiz.channelSnapshot.selected));
             if (step >= 8) {
                 nextBtn.style.display = 'none';
             } else {
@@ -9464,39 +9301,43 @@ function createNoteDetector(options = {}) {
                 <p class="text-gray-400 text-[10px] mb-2">This wizard may recommend <strong>input gain</strong> and <strong>detection delay (latency offset)</strong> only. It does not change scoring strictness, pitch windows, or detection thresholds.</p>
                 <p class="text-gray-400 text-[10px]">Tip: turn <strong>Detect</strong> on before starting step 1.</p>`;
         } else if (step === 1) {
-            const engineOk = snap.enabled && (usingDesktopBridge || audioCtx);
-            const probeBusy = wiz.channelProbeRunning;
-            const probeAmbiguous = wiz.channelProbeResult && wiz.channelProbeResult.ok === 'ambiguous';
-            const probePickHtml = probeAmbiguous
-                ? `<div class="flex flex-col gap-1 mt-2">
-                    <button type="button" class="nd-cal-pick-channel w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200" data-ch="0">Ch 1 — Dry / Clean</button>
-                    <button type="button" class="nd-cal-pick-channel w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200" data-ch="1">Ch 2 — Wet / FX</button>
-                   </div>`
-                : '';
-            const probeResultBoxClass = 'nd-cal-channel-probe-result text-[11px] mt-2 p-2 rounded-lg border border-gray-600 bg-dark-800/90';
-            const probeResultHtml = wiz.channelProbeResult
-                ? `<div class="${probeResultBoxClass}">${_calWizardFormatChannelProbeResult(wiz.channelProbeResult)}${probePickHtml}</div>`
-                : (wiz.channelProbeError
-                    ? `<div class="${probeResultBoxClass} text-amber-200/90">${_ndEscapeHtml(wiz.channelProbeError)}</div>`
-                    : '');
+            const busy = wiz.channelProbeRunning;
+            const native = !!_calWizardWizardAudioApi()?.getInputChannelSnapshot;
+            const snapshot = wiz.channelSnapshot;
+            const channels = snapshot?.channels || [];
+            const result = wiz.channelProbeResult;
+            const candidates = result?.candidates || [];
+            const displayChannels = [...channels].sort((a, b) =>
+                Number(candidates.some(c => c.index === b.index)) - Number(candidates.some(c => c.index === a.index)) || a.index - b.index);
+            const label = c => _ndEscapeHtml(_ndInputChannelLabel(c));
+            const resultText = result?.applied ? 'Channel saved. Play a note and check the detected pitch below.'
+                : result ? (candidates.length === 0 ? 'No clear playing signal found. Check the cable and input level, then retry or choose a channel manually.'
+                    : candidates.length === 1 ? `Playing signal found on ${_ndInputChannelLabel(candidates[0])}. Confirm the selection below.`
+                    : 'Several channels responded. Choose the signal you want to use; level alone cannot identify a dry guitar signal.') : '';
+            const disabled = busy ? ' disabled' : '';
             html = `
                 ${_calWizardDetectBanner(snap)}
-                <p class="text-gray-300 text-xs mb-2">Confirm which input channel Slopsmith is listening to. Strum while auto-detect runs.</p>
-                <div class="text-[11px] text-gray-300 font-mono space-y-1 mb-2">
-                    <div>Device: ${_calWizardDeviceLabel()}</div>
-                    <div>Channel: ${snap.channel || '—'}</div>
-                    <div>Detector: ${snap.source || '—'}</div>
-                    <div>Engine: ${engineOk ? 'Running' : 'Not ready — enable Detect'}</div>
-                </div>
+                <p class="text-gray-300 text-xs mb-2">Select the channel carrying your instrument, or search while you play.</p>
+                <div class="text-[11px] text-gray-300 mb-2">Device: ${_ndEscapeHtml(_calWizardDeviceLabel())}</div>
                 <div class="nd-cal-live-level text-cyan-300/90 text-xs font-mono mb-2">Live: —</div>
-                <button type="button" class="nd-cal-auto-channel w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mb-2${probeBusy ? ' opacity-60 cursor-not-allowed' : ''}"${probeBusy ? ' disabled' : ''}>${probeBusy ? 'Detecting...' : 'Auto-detect Channel'}</button>
-                <div class="nd-cal-channel-probe-status text-[11px] text-gray-400 mb-2 min-h-[1.5rem]">${probeBusy
-                    ? '<span class="text-cyan-300/90">Testing Mono Mix (1 of 3)…</span>'
-                    : 'Tests Mono Mix, Ch 1 (dry), and Ch 2 (wet) on the desktop audio engine.'}</div>
-                ${probeResultHtml}
-                <p class="text-[10px] text-gray-500 mb-1"><strong class="text-gray-400">Desktop:</strong> this step sets the native audio engine channel (saved automatically when a winner is found).</p>
-                <p class="text-[10px] text-gray-500">The <strong>Input Channel</strong> dropdown below only applies to browser microphone fallback — not desktop audio.</p>
-                <p class="text-[10px] text-amber-200/80">If stuck: check USB cable, interface gain, turn Detect on, and strum loudly during the test.</p>`;
+                ${native ? `
+                    <label class="block text-gray-300 text-xs mb-1" for="nd-cal-native-channel">Input channel</label>
+                    <select id="nd-cal-native-channel" class="nd-cal-native-channel w-full bg-dark-600 text-gray-200 rounded px-2 py-2 mb-2"${disabled}>
+                        <option value="-1"${wiz.channelChoice === -1 ? ' selected' : ''}>Mono Mix (inputs 1–2)</option>
+                        ${channels.map(c => `<option value="${c.index}"${wiz.channelChoice === c.index ? ' selected' : ''}>${label(c)}</option>`).join('')}
+                    </select>
+                    <div class="max-h-32 overflow-y-auto text-[11px] mb-2" aria-label="Input signal levels">
+                        ${displayChannels.map(c => `<div class="flex justify-between gap-2 py-1"><span>${label(c)}${candidates.some(x => x.index === c.index) ? ' · signal found' : ''}</span><span class="shrink-0" data-channel-level="${c.index}">—</span></div>`).join('')}
+                    </div>
+                    <button type="button" class="nd-cal-auto-channel w-full py-2 bg-dark-600 rounded-lg text-xs text-gray-200 mb-2"${disabled}>${busy ? 'Checking input…' : 'Auto-detect Channel'}</button>
+                    <div class="nd-cal-channel-probe-status text-[11px] text-cyan-300 mb-2" role="status">${_ndEscapeHtml(resultText)}</div>
+                    ${wiz.channelProbeError ? `<p class="text-amber-200 text-xs mb-2" role="alert">${_ndEscapeHtml(wiz.channelProbeError)}</p>` : ''}
+                    <button type="button" class="nd-cal-use-channel w-full py-2 bg-accent rounded-lg text-xs font-semibold text-white mb-2"${busy || !snapshot ? ' disabled' : ''}>Use selected channel</button>
+                ` : `<p class="text-gray-400 text-xs">${sourceId != null && sourceId !== 0
+                    ? 'This detector uses an additional input source. Choose its channel in that source’s settings.'
+                    : 'Use the Input Channel control for your browser microphone. All-channel search requires the updated desktop audio engine.'}</p>`}
+                <p class="text-[10px] text-gray-400">After selecting a channel, play a note with Detect enabled to confirm it is heard.</p>
+                <div class="nd-cal-heard text-cyan-300 text-xs mt-2" role="status">Now hearing: —</div>`;
         } else if (step === 2) {
             html = `
                 <p class="text-gray-300 text-xs mb-2">Tune your guitar using the bottom <strong class="text-gray-200">Tuner</strong> panel.</p>
@@ -9515,7 +9356,7 @@ function createNoteDetector(options = {}) {
                     ? `Captured: avg ${wiz.noise.avgPct}% · peak ${wiz.noise.peakPct}% · ${_calWizardNoiseStatusDisplay(wiz.noise.status)}`
                     : 'Ready to measure room noise.'}</div>
                 <button type="button" class="nd-cal-start-noise w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mb-1">${nDone ? 'Retry Noise Capture' : 'Start Noise Capture'}</button>
-                <p class="text-[10px] text-gray-500">If <strong>Too noisy</strong>: lower input gain, move away from amps/fans, or try the dry (Ch 1) input.</p>`;
+                <p class="text-[10px] text-gray-500">If <strong>Too noisy</strong>: lower input gain, move away from amps/fans, or select a clean instrument input.</p>`;
         } else if (step === 4) {
             const sDone = wiz.signal && wiz.signal.captured;
             html = `
@@ -9684,12 +9525,15 @@ function createNoteDetector(options = {}) {
             };
         }
 
-        body.querySelectorAll('.nd-cal-pick-channel').forEach((btn) => {
-            btn.onclick = () => {
-                const ch = parseInt(btn.getAttribute('data-ch'), 10);
-                if (Number.isFinite(ch)) _calWizardApplyChannelProbeUserPick(ch);
-            };
-        });
+        const nativeChannel = body.querySelector('.nd-cal-native-channel');
+        if (nativeChannel) nativeChannel.onchange = () => {
+            if (_calWizardState === wiz) {
+                wiz.channelChoice = Number(nativeChannel.value);
+                if (nextBtn) nextBtn.disabled = !!wiz.channelSnapshot && wiz.channelChoice !== wiz.channelSnapshot.selected;
+            }
+        };
+        const useChannel = body.querySelector('.nd-cal-use-channel');
+        if (useChannel) useChannel.onclick = () => _calWizardApplyChannelProbeUserPick(wiz.channelChoice);
 
         body.querySelectorAll('.nd-cal-check-note').forEach((btn) => {
             btn.onclick = () => {
@@ -9819,6 +9663,7 @@ function createNoteDetector(options = {}) {
         const enteredStep = wiz._autoEnterStep !== step;
         wiz._autoEnterStep = step;
         if (enteredStep && !wiz.complete && !wiz.tunerMinimized) {
+            if (step === 1) _calWizardRefreshChannels();
             if (step === 2) {
                 _calWizardOpenTunerFromWizard();
             }
@@ -9901,6 +9746,7 @@ function createNoteDetector(options = {}) {
             if (_calWizardState && !_calWizardState.tunerMinimized
                 && _calWizardState.step >= 1 && _calWizardState.step <= 6) {
                 _calWizardRefreshLive();
+                if (_calWizardState.step === 1) _calWizardRefreshChannels();
             }
         }, 200);
     }
