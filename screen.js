@@ -8671,13 +8671,73 @@ function createNoteDetector(options = {}) {
         _calWizardSetTunerMinimized(true);
     }
 
+    async function _calWizardOpenPlayback(timed) {
+        const wiz = _calWizardState;
+        if (!wiz || wiz.playbackLaunchPending) return;
+        wiz.playbackLaunchPending = true;
+        wiz.timingCaptureNote = 'Preparing playback…';
+        renderCalibrationWizard();
+        const current = () => _calWizardState === wiz && wiz.step === 6;
+        try {
+            const hw = resolveHw();
+            const info = hw?.getSongInfo?.();
+            let filename = null;
+            if (!info?.title) {
+                const context = _calWizardResolveNoteCheckContext();
+                if (context.arrangement !== 'guitar' || context.stringCount !== 6) {
+                    throw new Error('Open a song for your instrument from Song Library, then return to this timing step.');
+                }
+                const response = await fetch('/api/progression');
+                if (!response.ok) throw new Error('Could not find the built-in test song. Retry or open a song from Song Library.');
+                const data = await response.json();
+                filename = data.onboarding?.diagnostic_filename;
+                if (!filename || typeof window.playSong !== 'function')
+                    throw new Error('No test song is available. Open a song from Song Library and retry.');
+            }
+            if (!current()) return;
+            wiz.timingCaptureNote = null;
+            if (timed) {
+                _calWizardStartTimedPlayAlong(_CAL_WIZARD_TIMED_PLAYALONG_SEC);
+                if (!wiz.playAlong) return; // Detection may have been disabled.
+            } else {
+                _calWizardStopTimedPlayAlong('manual-playback');
+                _calWizardMinimizeForPlayback();
+            }
+            if (filename) {
+                // The song loader owns autoplay; register timing listeners above
+                // before loading so an early song:play event cannot be missed.
+                await window.playSong(encodeURIComponent(filename), undefined, { bridge: false });
+            } else {
+                if (typeof window.showScreen === 'function') window.showScreen('player');
+                if (!_calWizardIsPlaybackActive()) {
+                    const caps = window.slopsmith?.capabilities;
+                    if (!caps?.dispatch) throw new Error('Press Play in the song player to begin.');
+                    const result = await caps.dispatch({ capability: 'playback', command: 'resume',
+                        requester: 'slopsmith-plugin-notedetect',
+                        args: { requesterId: 'cal-wizard-playalong', priority: 'user' } });
+                    if (result?.outcome !== 'handled' && result?.status !== 'playing')
+                        throw new Error(result?.reason || 'Playback could not start. Retry from the song player.');
+                }
+            }
+        } catch (e) {
+            if (current()) {
+                _calWizardStopTimedPlayAlong('load-failed');
+                _calWizardSetTunerMinimized(false);
+                wiz.timingCaptureNote = e.message || 'Could not open the song. Please retry.';
+            }
+        } finally {
+            wiz.playbackLaunchPending = false;
+            if (current()) renderCalibrationWizard();
+        }
+    }
+
     function _calWizardUpdateReturnButtonTimer(secLeft) {
         if (!_calWizardEl) return;
         const primary = _calWizardEl.querySelector('.nd-cal-return-primary');
         const secondary = _calWizardEl.querySelector('.nd-cal-return-secondary');
         if (!primary || !secondary) return;
         if (secLeft === 'waiting') {
-            primary.textContent = 'Press Play to start timing';
+            primary.textContent = 'Waiting for song playback';
             secondary.textContent = `The ${_CAL_WIZARD_TIMED_PLAYALONG_SEC}s timer starts when playback begins`;
         } else if (Number.isFinite(secLeft) && secLeft >= 0) {
             primary.textContent = `Timing test: ${secLeft}s left`;
@@ -9621,18 +9681,18 @@ function createNoteDetector(options = {}) {
             const liveMed = snap.timingMedianMs;
             const liveN = (snap.diagnostic && snap.diagnostic.timing_error_ms_hits)
                 ? snap.diagnostic.timing_error_ms_hits.count : 0;
-            const playAlongBusy = !!(wiz.playAlong);
+            const playAlongBusy = !!(wiz.playAlong || wiz.playbackLaunchPending);
             html = `
                 ${_calWizardDetectBanner(snap)}
-                <p class="text-gray-300 text-xs mb-2"><strong class="text-gray-200">Play part of a song</strong> with Detect on so hits are scored. Tap <strong>Minimize Wizard — Play Song</strong> to reach the song highway (then <strong>Return to Calibration Wizard</strong> to come back), or <strong>Start Timed Play-Along Test</strong> for a clean ${_CAL_WIZARD_TIMED_PLAYALONG_SEC}s sample window.</p>
+                <p class="text-gray-300 text-xs mb-2"><strong class="text-gray-200">Play part of a song</strong> with Detect on so hits are scored. <strong>Play Song</strong> opens the current song, or the built-in guitar test if none is loaded. Use <strong>Return to Calibration Wizard</strong> to come back, or choose the timed test for a ${_CAL_WIZARD_TIMED_PLAYALONG_SEC}s sample window that starts with playback.</p>
                 <p class="text-[10px] text-gray-500 mb-2">Use the speed you normally practice. This measures input vs chart alignment, not tempo.</p>
                 <div class="nd-cal-timing-median text-gray-300 text-xs mb-2">Your average timing vs chart: —</div>
                 <p class="text-[10px] text-gray-500 mb-2">Live session: ${Number.isFinite(liveMed) ? _ndFormatMs(liveMed) + ' average' : 'not enough hits yet'} · ${liveN} hit samples</p>
                 <p class="text-[10px] text-gray-500 mb-2"><strong class="text-gray-400">Chart/video offset</strong> (main Settings) moves notes on screen. <strong class="text-gray-400">Detection delay</strong> (latency offset) moves when your playing is judged — this step helps tune detection delay.</p>
                 <p class="text-[10px] text-amber-200/80">Mostly late? Detection delay may need increasing. Mostly early? Try lowering it.</p>
-                ${wiz.timingCaptureNote ? `<p class="text-[10px] text-cyan-300/90 mb-2">${wiz.timingCaptureNote}</p>` : ''}
+                ${wiz.timingCaptureNote ? `<p class="text-[10px] text-cyan-300/90 mb-2">${_ndEscapeHtml(wiz.timingCaptureNote)}</p>` : ''}
                 <button type="button" class="nd-cal-start-playalong w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mb-2${playAlongBusy ? ' opacity-60 cursor-not-allowed' : ''}"${playAlongBusy ? ' disabled' : ''}>Start Timed Play-Along Test (${_CAL_WIZARD_TIMED_PLAYALONG_SEC}s)</button>
-                <button type="button" class="nd-cal-minimize-play w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200 mb-2">Minimize Wizard — Play Song</button>
+                <button type="button" class="nd-cal-minimize-play w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200 mb-2"${playAlongBusy ? ' disabled' : ''}>Play Song</button>
                 <button type="button" class="nd-cal-reset-timing w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200 mb-2">Reset Timing Samples</button>
                 <button type="button" class="nd-cal-capture-timing w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mb-1">Capture Timing Snapshot</button>
                 ${t && t.captured ? `<p class="text-[10px] text-green-300/90">Stored: ${_ndFormatMs(t.medianMs)} · ${t.sampleCount} samples</p>` : ''}`;
@@ -9770,15 +9830,12 @@ function createNoteDetector(options = {}) {
 
         const startPlayAlong = body.querySelector('.nd-cal-start-playalong');
         if (startPlayAlong) {
-            startPlayAlong.onclick = () => _calWizardStartTimedPlayAlong(_CAL_WIZARD_TIMED_PLAYALONG_SEC);
+            startPlayAlong.onclick = () => _calWizardOpenPlayback(true);
         }
 
         const minimizePlay = body.querySelector('.nd-cal-minimize-play');
         if (minimizePlay) {
-            minimizePlay.onclick = () => {
-                _calWizardStopTimedPlayAlong('manual-minimize');
-                _calWizardMinimizeForPlayback();
-            };
+            minimizePlay.onclick = () => _calWizardOpenPlayback(false);
         }
 
         body.querySelectorAll('.nd-cal-apply-chk').forEach((chk) => {
@@ -9829,9 +9886,8 @@ function createNoteDetector(options = {}) {
         //
         // The Timing step does NOT auto-minimize: a later tester reported the
         // step "does not load" because the card vanished the instant they
-        // reached it. The step keeps explicit "Minimize Wizard — Play Song" and
-        // "Start Timed Play-Along Test" buttons (both minimize on click) so the
-        // highway is still reachable on demand.
+        // reached it. Explicit playback buttons load or resume the song and
+        // minimize only after a usable playback target has been resolved.
         const enteredStep = wiz._autoEnterStep !== step;
         wiz._autoEnterStep = step;
         if (enteredStep && !wiz.complete && !wiz.tunerMinimized) {
@@ -15685,7 +15741,9 @@ function createNoteDetector(options = {}) {
             panel.remove();
         }
         _vuSetPanel(null);
-        calibrationWizardClose();
+        // Loading a calibration song tears down detection temporarily. Keep
+        // the wizard and its return control across that internal handoff only.
+        if (!disableOptions?.preserveCalibration) calibrationWizardClose();
         calibrationLabClose();
 
         updateButton();
@@ -18622,6 +18680,7 @@ function createNoteDetector(options = {}) {
         openCalibrationWizard,
         launchCalibration,
         closeCalibrationWizard: calibrationWizardClose,
+        _hasCalibrationPlaybackHandoff: () => !!(_calWizardState?.step === 6 && _calWizardState.tunerMinimized),
         openInstrumentCalibrationLab,
         closeInstrumentCalibrationLab: calibrationLabClose,
         getCalibrationReport,
@@ -19168,7 +19227,10 @@ function _ndInstallPlaySongHook() {
         // here; the explicit `resetScoring()` on every instance
         // preserves that behaviour.
         for (const inst of _ndInstances) {
-            if (inst.isEnabled()) inst.disable({ silent: true });
+            if (inst.isEnabled()) inst.disable({
+                silent: true,
+                preserveCalibration: inst._hasCalibrationPlaybackHandoff?.() === true,
+            });
             if (typeof inst._resetScoring === 'function') inst._resetScoring();
         }
         const ret = await origPlaySong.apply(this, args);
