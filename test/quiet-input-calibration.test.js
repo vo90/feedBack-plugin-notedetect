@@ -12,7 +12,7 @@ function fixture(options = {}) {
         return { running: true, generation: options.changed && reads > 5 ? 2 : 1,
             selected: 6, sequence: options.stalled ? 1 : reads,
             channels: Array.from({ length: 8 }, (_, index) => ({ index, name: `USB ${index + 1}`,
-                peak: index === 6 ? (options.peak ?? 0.012) : 0.8 })) };
+                peak: index === 6 ? (typeof options.peak === 'function' ? options.peak(reads) : options.peak ?? 0.012) : 0.8 })) };
     } };
 }
 const wait = async () => {};
@@ -45,4 +45,8 @@ test('gain stays within the existing range and lowers hot signals', () => {
     assert.equal(scope._ndGainForRawPeak(0.1), 2.5);
     assert.equal(scope._ndGainForRawPeak(0.5), 0.5);
     assert.equal(scope._ndGainForRawPeak(10), 0.1);
+});
+test('the initial attack is included rather than boosting against its decay', async () => {
+    const result = await scope._ndCaptureSelectedInput(fixture({ peak: n => n === 2 ? 0.2 : 0.01 }), { kind: 'signal', wait });
+    assert.equal(Math.max(...result.samples.map(s => s.peak)), 20);
 });
