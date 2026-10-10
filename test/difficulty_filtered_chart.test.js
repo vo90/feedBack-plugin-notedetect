@@ -31,8 +31,8 @@ const FULL = [
 const DISPLAYED = [FULL[0], FULL[2]];
 
 // `filtered: null` models a core with no getFilteredNotes at all (downlevel).
-function engineSandbox({ filtered }) {
-    const calls = { getNoteVerdicts: 0, getPitchDetection: 0 };
+function engineSandbox({ filtered, stableReferences = false }) {
+    const calls = { getNoteVerdicts: 0, getPitchDetection: 0, hashMixes: 0 };
     const charts = [];              // every chart handed to setChart
     const intervalCallbacks = [];
     let live = filtered;            // mutable — tests move the slider mid-session
@@ -49,11 +49,15 @@ function engineSandbox({ filtered }) {
             return { midiNote: -1, confidence: 0, frequency: -1, cents: 0, noteName: '' };
         },
         setChart: async (chart) => { charts.push(chart); return true; },
+        harmonicTargetVersion: async () => 1,
+        whammyVersion: async () => 1,
         getNoteVerdicts: async () => { calls.getNoteVerdicts++; return []; },
     };
 
     const { createNoteDetector } = loadDetectionCore({
         sandboxBeforeRun(sb) {
+            sb.Math = Object.create(Math);
+            sb.Math.imul = (...args) => { calls.hashMixes++; return Math.imul(...args); };
             sb.setInterval = (cb) => {
                 if (typeof cb === 'function') intervalCallbacks.push(cb);
                 return intervalCallbacks.length;
@@ -61,7 +65,7 @@ function engineSandbox({ filtered }) {
             sb.highway.getNotes = () => FULL.map((n) => ({ ...n }));
             sb.highway.getChords = () => chordsFn();
             if (live !== null) {
-                sb.highway.getFilteredNotes = () => live.map((n) => ({ ...n }));
+                sb.highway.getFilteredNotes = () => stableReferences ? live : live.map((n) => ({ ...n }));
                 sb.highway.getFilteredChords = () => chordsFn();
             }
             sb.highway.getTime = () => 0;
@@ -231,6 +235,79 @@ test('a chord VOICING swap at the same onset still re-pushes', async () => {
 
     det.destroy();
     await flushPendingAsync();
+});
+
+test('unchanged chart values reuse the signature even when getters return copies', async () => {
+    const env = engineSandbox({ filtered: FULL });
+    env.setChords(() => [{t: 5, notes: [{s: 0, f: 5}, {s: 1, f: 7}]}]);
+    const det = env.createNoteDetector({ isDefault: false });
+    await det.enable();
+    await flushPendingAsync();
+    const detectTick = await driveDetectTick(env.intervalCallbacks, env.calls);
+    const mixes = env.calls.hashMixes, pushes = env.charts.length;
+    assert.ok(mixes > 0, 'the initial chart was hashed');
+    for (let i = 0; i < 8; i++) await detectTick();
+    assert.equal(env.calls.hashMixes, mixes, 'unchanged ticks do not repeat FNV mixing');
+    assert.equal(env.charts.length, pushes, 'unchanged chart is not resent');
+    det.destroy();
+});
+
+test('same-array note edits, membership swaps and chord member edits invalidate immediately', async () => {
+    const notes = [{s: 0, f: 1, t: 1, sus: 0}, {s: 1, f: 2, t: 2, sus: 0}];
+    const chords = [{t: 3, notes: [{s: 0, f: 3}, {s: 1, f: 5}]}];
+    const env = engineSandbox({filtered: notes, stableReferences: true});
+    env.setChords(() => chords);
+    const det = env.createNoteDetector({isDefault: false});
+    await det.enable();
+    await flushPendingAsync();
+    const tick = await driveDetectTick(env.intervalCallbacks, env.calls);
+    for (const change of [
+        () => { notes[0].sus = 2; notes[0].b = true; },
+        () => { notes[1] = {s: 2, f: 4, t: 2, sus: 0}; },
+        () => { chords[0].notes[1].f = 7; },
+        () => { chords[0].t = 3.5; },
+        () => { chords[0].notes.push({s: 2, f: 9}); },
+        () => { notes.splice(0, 1); },
+    ]) {
+        const pushes = env.charts.length;
+        change();
+        await tick();
+        assert.equal(env.charts.length, pushes + 1, 'an in-place change repushes on the next tick');
+    }
+    assert.equal(env.lastChart().notes.find(n => n.s === 1 && n.t === 3.5).f, 7);
+    det.destroy();
+});
+
+test('deep whammy and harmonic edits cannot hide behind stable object references', async () => {
+    const note = {s: 0, f: 7, t: 1, sus: 2, whammy: {version: 1, policy: 'optional',
+        segments: [{start: 0, end: 2, curve: [{t: 0, v: 0}, {t: 2, v: -1}]}]}};
+    const harmonic = {s: 1, f: 5, t: 4, sus: 1,
+        harmonic_target: {node: 12, interval: 12, kind: 'artificial', policy: 'harmonic'}};
+    const env = engineSandbox({filtered: [note, harmonic], stableReferences: true});
+    const det = env.createNoteDetector({isDefault: false});
+    await det.enable();
+    await flushPendingAsync();
+    const tick = await driveDetectTick(env.intervalCallbacks, env.calls);
+    let mixes = env.calls.hashMixes;
+    await tick();
+    assert.equal(env.calls.hashMixes, mixes, 'unchanged nested payloads reuse the signature');
+    for (const change of [
+        () => { note.whammy.segments[0].curve[1].v = -2; },
+        () => { note.whammy.segments[0].curve.push({t: 1, v: -0.5}); },
+        () => { note.whammy = {segments: note.whammy.segments, policy: 'optional', version: 1}; },
+        () => { harmonic.harmonic_target.node = 7; harmonic.harmonic_target.interval = 19; },
+        () => { note.whammy.segments[0].vibrato = true; },
+        () => { delete note.whammy.segments[0].vibrato; },
+        () => { note.pick_scrape_marks = [{start: 0, end: 1}]; },
+        () => { note.pick_scrape_marks.length = 0; },
+    ]) {
+        const pushes = env.charts.length;
+        change();
+        await tick();
+        assert.equal(env.charts.length, pushes + 1, 'nested/eligibility edits repush immediately');
+    }
+    assert.equal(env.lastChart().notes.find(n => n.t === 4).harmonic_target.interval, 19);
+    det.destroy();
 });
 
 test('a chord-only difficulty falls back to chord constituents for A/V calibration', () => {

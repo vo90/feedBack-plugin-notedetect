@@ -2787,6 +2787,49 @@ function _ndScoringHealthy(enabled, usingBridge, extActive, cbFresh) {
     return !!(enabled && (usingBridge || extActive || cbFresh));
 }
 
+// Independent snapshots are intentional: chart getters expose live objects and
+// older hosts/plugins can edit them in place. Reference identity cannot prove a
+// scoring chart unchanged. Compare the hash's inputs cheaply before rehashing.
+function _ndSignatureCopy(value) {
+    if (!value || typeof value !== 'object') return value;
+    const out = Array.isArray(value) ? new Array(value.length) : {};
+    for (const key of Object.keys(value)) out[key] = _ndSignatureCopy(value[key]);
+    return out;
+}
+function _ndSignatureEqual(value, saved) {
+    if (Object.is(value, saved)) return true;
+    if (!value || !saved || typeof value !== 'object' || typeof saved !== 'object'
+        || Array.isArray(value) !== Array.isArray(saved)
+        || (Array.isArray(value) && value.length !== saved.length)) return false;
+    const keys = Object.keys(value), savedKeys = Object.keys(saved);
+    if (keys.length !== savedKeys.length) return false;
+    for (let i = 0; i < keys.length; i++) {
+        const key = keys[i];
+        if (key !== savedKeys[i] || !_ndSignatureEqual(value[key], saved[key])) return false;
+    }
+    return true;
+}
+function _ndSignatureNote(n, t) {
+    if (!n) return null;
+    return { t, s: n.s, f: n.f, sus: n.sus, ho: n.ho, po: n.po, b: n.b,
+        sl: n.sl, hm: n.hm, mt: n.mt, hps: n.hps, bn: n.bn,
+        bendCount: n.bnv?.length, scrapeCount: n.pick_scrape_marks?.length,
+        scrapeArray: Array.isArray(n.pick_scrape_marks),
+        target: _ndSignatureCopy(n.harmonic_target), whammy: _ndSignatureCopy(n.whammy) };
+}
+function _ndSignatureNoteEqual(n, t, saved) {
+    if (!n) return saved === null;
+    return !!saved && t === saved.t
+        && n.s === saved.s && n.f === saved.f && n.sus === saved.sus
+        && n.ho === saved.ho && n.po === saved.po && n.b === saved.b
+        && n.sl === saved.sl && n.hm === saved.hm && n.mt === saved.mt
+        && n.hps === saved.hps && n.bn === saved.bn
+        && n.bnv?.length === saved.bendCount && n.pick_scrape_marks?.length === saved.scrapeCount
+        && Array.isArray(n.pick_scrape_marks) === saved.scrapeArray
+        && (n.harmonic_target === saved.target || _ndSignatureEqual(n.harmonic_target, saved.target))
+        && (n.whammy === saved.whammy || _ndSignatureEqual(n.whammy, saved.whammy));
+}
+
 function createNoteDetector(options = {}) {
     const opts = options || {};
     // Range eligibility belongs to this detector's current tuning, never a
@@ -14077,11 +14120,34 @@ function createNoteDetector(options = {}) {
     // Cheap signature of the currently-loaded chart — raw note/chord counts
     // plus the active arrangement. Changes exactly when the chart the engine
     // should be scoring changes (late load, song change, arrangement switch).
+    // Validation remains O(chart), including on older hosts with mutable chart
+    // objects. Only the last chart is retained, and disable releases the copy.
+    let _ndChartSignatureCache = null;
     function _ndChartSignature() {
         if (!hw || typeof hw.getNotes !== 'function') return '';
         // Filtered, so MOVING THE MASTERY SLIDER changes the signature and the
         // detect loop re-pushes the reduced chart to the engine (feedback#226).
         const notes = _ndChartNotes();
+        const chords = _ndChartChords();
+        const context = currentArrangement + ':' + currentStringCount + ':' + capo
+            + ':' + timingTolerance + ':' + pitchTolerance;
+        const previous = _ndChartSignatureCache;
+        if (previous && previous.context === context
+            && _ndSignatureEqual(tuningOffsets, previous.tuning)
+            && previous.notes.length === notes.length && previous.chords.length === chords.length) {
+            let same = true;
+            for (let i = 0; same && i < notes.length; i++) {
+                same = _ndSignatureNoteEqual(notes[i], notes[i]?.t, previous.notes[i]);
+            }
+            for (let i = 0; same && i < chords.length; i++) {
+                const chord = chords[i], saved = previous.chords[i], members = chord?.notes || [];
+                same = chord?.t === saved.t && members.length === saved.notes.length;
+                for (let j = 0; same && j < members.length; j++) {
+                    same = _ndSignatureNoteEqual(members[j], chord?.t, saved.notes[j]);
+                }
+            }
+            if (same) return previous.signature;
+        }
         const n = notes.length;
         let c = 0;
         // Content hash over the note/chord IDENTITIES, not just how many there
@@ -14089,8 +14155,10 @@ function createNoteDetector(options = {}) {
         // on song/arrangement load, but the mastery slider can swap WHICH notes
         // are displayed without changing HOW MANY — two slider positions with the
         // same total would hash identically and leave the engine scoring a chart
-        // that is no longer on screen. FNV-1a over (t, s, f); O(chart) on the
-        // 50 ms tick is nothing beside the FFT work already on this path.
+        // that is no longer on screen. Recompute the FNV-1a content hash only
+        // after value validation finds a change. The verifier's
+        // FFT now runs natively; rehashing this chart every 50 ms wastes renderer
+        // time and allocates a temporary object for every chord member.
         let fnv = 0x811c9dc5;
         const mix = (v) => { fnv ^= (v | 0); fnv = Math.imul(fnv, 0x01000193); };
         // Hash EVERY field _ndPushChartToBridge actually sends, not just position:
@@ -14113,7 +14181,7 @@ function createNoteDetector(options = {}) {
                 | (nn.sl ? 8 : 0) | (nn.hm ? 16 : 0) | (nn.mt ? 32 : 0) | (_ndIsVisualGesture(nn) ? 64 : 0));
         };
         for (const nn of notes) if (nn) mixNote(nn);
-        for (const ch of _ndChartChords()) {
+        for (const ch of chords) {
             const members = (ch && ch.notes) || [];
             c += members.length;
             mix(Math.round((ch && Number.isFinite(ch.t) ? ch.t : 0) * 1000));
@@ -14127,9 +14195,12 @@ function createNoteDetector(options = {}) {
         // a tolerance slider re-pushes the chart and the engine picks the new
         // value up live — without this the popup sliders are inert on the
         // engine-verifier path until the next song/arrangement change.
-        return n + ':' + c + ':' + currentArrangement + ':' + currentStringCount
-            + ':' + capo + ':' + timingTolerance + ':' + pitchTolerance
-            + ':' + (fnv >>> 0);
+        const signature = n + ':' + c + ':' + context + ':' + (fnv >>> 0);
+        _ndChartSignatureCache = { context, tuning: _ndSignatureCopy(tuningOffsets), signature,
+            notes: notes.map(nn => _ndSignatureNote(nn, nn?.t)),
+            chords: chords.map(ch => ({t: ch?.t,
+                notes: (ch?.notes || []).map(nn => _ndSignatureNote(nn, ch?.t))})) };
+        return signature;
     }
 
     async function _ndPushChartToBridge() {
@@ -15683,6 +15754,7 @@ function createNoteDetector(options = {}) {
     // named distinctly from the factory's outer `opts` to avoid the
     // lexical shadow.
     function disable(disableOptions) {
+        _ndChartSignatureCache = null;
         if (!enabled) return;
         enabled = false;
         // A conductor drill is pointless without detection running — end it so
