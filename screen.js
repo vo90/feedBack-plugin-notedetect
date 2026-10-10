@@ -12580,6 +12580,12 @@ function createNoteDetector(options = {}) {
         removeHUD();
     }
 
+    // Keep the HUD tick and its animation state unchanged; replacing identical
+    // text still creates DOM work, including while the scoreboard is hidden.
+    function _ndSetHudText(el, text) {
+        if (el.textContent !== text) el.textContent = text;
+    }
+
     function updateHUD() {
         if (!enabled) return;
 
@@ -12618,7 +12624,7 @@ function createNoteDetector(options = {}) {
             if (score < displayScore) displayScore = score;
             const diff = score - displayScore;
             displayScore = diff < 1 ? score : displayScore + diff * 0.25;
-            scoreEl.textContent = String(Math.round(displayScore));
+            _ndSetHudText(scoreEl, String(Math.round(displayScore)));
         }
 
         if (multEl && multiplier !== lastMultTier) {
@@ -12637,16 +12643,16 @@ function createNoteDetector(options = {}) {
         if (accEl && total > 0) {
             const accuracy = Math.round((hits / total) * 100);
             const color = accuracy >= 90 ? '#00ff88' : accuracy >= 70 ? '#ffcc00' : '#ff4444';
-            accEl.textContent = accuracy + '%';
+            _ndSetHudText(accEl, accuracy + '%');
             accEl.style.color = color;
         } else if (accEl) {
-            accEl.textContent = '';
+            _ndSetHudText(accEl, '');
         }
 
         if (streakEl) {
             let text = streak > 0 ? `${streak} streak` : '';
             if (bestStreak > 0) text += `  best: ${bestStreak}`;
-            streakEl.textContent = text;
+            _ndSetHudText(streakEl, text);
             if (streak === 0 && lastStreakVal >= 10) {
                 // A multiplier-worthy streak just broke — shake the panel.
                 const hudEl = instanceRoot.querySelector('.nd-hud');
@@ -12664,12 +12670,12 @@ function createNoteDetector(options = {}) {
         }
 
         if (countsEl && total > 0) {
-            countsEl.textContent = `${hits} / ${total}`;
+            _ndSetHudText(countsEl, `${hits} / ${total}`);
         } else if (countsEl) {
             // Clear on zero-total so a reset/new-song enable doesn't
             // show the previous session's `X / Y` until the first
             // judgment lands. Mirrors the accuracy label's else-branch.
-            countsEl.textContent = '';
+            _ndSetHudText(countsEl, '');
         }
 
         if (detectedEl) {
@@ -12679,7 +12685,7 @@ function createNoteDetector(options = {}) {
                 // non-standard tuning, and capo all still route through the
                 // same MIDI-name formatter instead of string-index lookups.
                 const displayMidi = Number.isFinite(detectedDisplayMidi) ? detectedDisplayMidi : detectedMidi;
-                detectedEl.textContent = `${_ndMidiToName(displayMidi)} · s${detectedString} f${detectedFret}`;
+                _ndSetHudText(detectedEl, `${_ndMidiToName(displayMidi)} · s${detectedString} f${detectedFret}`);
             } else if (lastChordScore !== null) {
                 // No confident single-note detected this frame, but we
                 // have a recent chord score from the constraint path —
@@ -12690,12 +12696,12 @@ function createNoteDetector(options = {}) {
                 const CHORD_HUD_TTL_SEC = 1.5;
                 if (songTime - lastChordTime <= CHORD_HUD_TTL_SEC) {
                     const pct = Math.round(lastChordScore * 100);
-                    detectedEl.textContent = `chord ${lastChordHit}/${lastChordTotal} (${pct}%)`;
+                    _ndSetHudText(detectedEl, `chord ${lastChordHit}/${lastChordTotal} (${pct}%)`);
                 } else {
-                    detectedEl.textContent = '';
+                    _ndSetHudText(detectedEl, '');
                 }
             } else {
-                detectedEl.textContent = '';
+                _ndSetHudText(detectedEl, '');
             }
         }
 
