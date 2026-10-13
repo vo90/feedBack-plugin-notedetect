@@ -803,10 +803,16 @@ function _ndFrettedHarmonic(n) {
     const nodes = {12:12,7:19,19:19,5:24,24:24,4:28,9:28,16:28,3.2:31,
         2.7:34,5.8:34,9.6:34,14.7:34,21.7:34,2.4:36,8.2:36,17:36};
     const policies = {pinch:'harmonic',artificial:'harmonic',tapped:'harmonic',semi:'mixed',feedback:'attack_either'};
-    return h && Object.keys(h).length === 4 && Number.isFinite(h.node)
+    if (!h || typeof h !== 'object' || Array.isArray(h) || n.hm
+        || !Number.isInteger(n.f) || n.f < 0 || n.f > 48) return null;
+    const keys = Object.keys(h).sort().join(',');
+    if (keys === 'basis,interval,kind,node,policy')
+        return h.kind === 'artificial' && h.node === null && h.interval === 24
+            && h.policy === 'harmonic' && h.basis === 'source-playback-fallback' ? h : null;
+    return keys === 'interval,kind,node,policy' && Number.isFinite(h.node)
         && Number.isInteger(h.interval) && nodes[h.node] === h.interval
         && Object.hasOwn(policies,h.kind) && policies[h.kind] === h.policy
-        && !n.hm && Number.isInteger(n.f) && n.f >= 0 && n.f <= 48 ? h : null;
+        ? h : null;
 }
 // Strict additive contact contract; detection keeps the original attack target.
 function _ndHarmonicContact(n) {
@@ -817,7 +823,8 @@ function _ndHarmonicContact(n) {
         || !Number.isFinite(e.start) || !Number.isFinite(e.end) || !(0<e.start && e.start<e.end)
         || Math.abs(e.end-n.sus)>.0000011 || typeof e.source_id!=='string' || !e.source_id.length || e.source_id.length>512
         || ['hm','hp','mt','fhm'].some(k=>n[k]) || ['harmonic_target','hn','hps','harmonic_alias'].some(k=>n[k]!==undefined)
-        || e.target?.kind!=='artificial' || !_ndFrettedHarmonic({f:n.f,harmonic_target:e.target})) return null;
+        || e.target?.kind!=='artificial' || !Number.isFinite(e.target.node)
+        || !_ndFrettedHarmonic({f:n.f,harmonic_target:e.target})) return null;
     return e;
 }
 function _ndContactDeadline(n,onset,tolerance,grace=0) {
@@ -3940,6 +3947,8 @@ function createNoteDetector(options = {}) {
     const _ndHarmonicBridgeVersions = new WeakMap();
     async function _ndRequireHarmonicTargetSupport(a, notes) {
         const harmonic=(notes || []).some(n=>n?.harmonic_target !== undefined);
+        const fallback=(notes || []).some(n=>n?.harmonic_target?.node === null
+            || n?.harmonic_target?.basis !== undefined);
         const bar=(notes || []).some(n=>n?.whammy !== undefined);
         const contact=(notes || []).some(n=>n?.harmonic_changes !== undefined);
         if (!harmonic && !bar && !contact) return;
@@ -3948,7 +3957,8 @@ function createNoteDetector(options = {}) {
             typeof a.whammyVersion === 'function' ? a.whammyVersion() : 0,
             typeof a.harmonicContactVersion === 'function' ? a.harmonicContactVersion() : 0]));
         const versions=await _ndHarmonicBridgeVersions.get(a);
-        if ((harmonic && versions[0] !== 1) || (bar && versions[1] !== 1) || (contact && versions[2] !== 1)) {
+        if ((harmonic && versions[0] !== 1 && versions[0] !== 2) || (fallback && versions[0] !== 2)
+            || (bar && versions[1] !== 1) || (contact && versions[2] !== 1)) {
             _ndHarmonicSupportBlocked = true;
             const message='Scoring paused: these techniques require an updated FeedBack Desktop audio engine.';
             if (!instanceRoot.querySelector('.nd-harmonic-compatibility')) {
@@ -14179,8 +14189,8 @@ function createNoteDetector(options = {}) {
             if (nn.whammy) for (const ch of JSON.stringify(nn.whammy)) mix(ch.charCodeAt(0));
             const target = nn.harmonic_target;
             if (target) {
-                mix(Math.round(target.node * 1000)); mix(target.interval);
-                for (const ch of String(target.kind) + ':' + String(target.policy)) mix(ch.charCodeAt(0));
+                mix(target.node === null ? -1 : Math.round(target.node * 1000)); mix(target.interval);
+                for (const ch of String(target.kind) + ':' + String(target.policy) + ':' + String(target.basis || '')) mix(ch.charCodeAt(0));
             }
             mix(Math.round((Number.isFinite(nn.sus) ? nn.sus : 0) * 1000));
             mix((nn.ho ? 1 : 0) | (nn.po ? 2 : 0) | (nn.b ? 4 : 0)
