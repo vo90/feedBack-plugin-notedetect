@@ -843,7 +843,24 @@ function _ndContactSustainFret(n,elapsed) {
             bend=b.v;
         }
     }
-    return n.f+_ndNaturalPitchSemitones(e.target.interval)+bend;
+    // A qualified contact can retain its harmonic node through a later,
+    // explicitly timed pitched slide. This is held-note feedback, not a new
+    // picked target. Match the highway's existing pitched-slide trajectory.
+    const i=n.slide_interval;
+    let fret=n.f;
+    if(i && Object.keys(i).sort().join(',')==='end,start'
+        && Number.isInteger(n.f) && n.f>0 && n.f<=24
+        && Number.isInteger(n.sl) && n.sl>0 && n.sl<=24 && n.sl!==n.f
+        && Number.isFinite(i.start) && Number.isFinite(i.end)
+        && e.start<i.start && i.start<i.end && i.end<=n.sus+.0000011
+        && !(n.slu>=0) && !n.b && !n.bn && !n.bt && !n.bnv?.length && !n.whammy
+        && !n.vb && !n.vibrato_marks?.length && !n.tr && !n.tremolo_marks?.length
+        && !n.ho && !n.po && !n.pick_scrape_marks?.length
+        && !n.slide_out && !n.slide_out_marks?.length && !n.slide_in_marks?.length && !n.slide_in) {
+        const progress=Math.max(0,Math.min(1,(elapsed-i.start)/(i.end-i.start)));
+        fret+=(n.sl-n.f)*Math.pow(Math.sin(progress*Math.PI/2),3);
+    }
+    return fret+_ndNaturalPitchSemitones(e.target.interval)+bend;
 }
 
 function _ndScoringFret(n, result) {

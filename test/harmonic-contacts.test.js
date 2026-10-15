@@ -33,6 +33,46 @@ test('actual browser scorer never credits a late contact as the original pick',(
         assert.equal(score(ah).totalStrings,1);
     }
 });
+test('a later timed slide moves held harmonic feedback without another picked target',()=>{
+    const n=note();n.f=4;n.sus=8;n.sl=7;n.slide_interval={start:7.5,end:7.75};
+    const e=n.harmonic_changes.events[0];e.start=2;e.end=8;
+    e.target={kind:'artificial',node:5,interval:24,policy:'harmonic'};
+    // Non-monotonic order covers backward seek/repeat. Elapsed time is chart
+    // time, so playback speed does not change the expected fret at that time.
+    for(const t of [7.75,2,7.625,7.5,8,7.6,1.99]) {
+        const p=Math.max(0,Math.min(1,(t-7.5)/.25));
+        const want=t<2?null:28+3*Math.pow(Math.sin(p*Math.PI/2),3);
+        assert.equal(h._ndContactSustainFret(n,t),want);
+    }
+    assert.equal(h._ndContactDeadline(n,1,.2,4),3);
+    const core=loadDetectionCore();
+    const ordinary=harmonicMix(midiToFreq(44),[[1,.4],[2,.04]],48000,.35);
+    const harmonic=harmonicMix(midiToFreq(71),[[1,.4],[2,.04]],48000,.35);
+    for(const elapsed of [.05,1.999,2,7.5,7.75]) {
+        const score=pcm=>core.scoreChord(pcm,48000,[{...n,elapsed}],'guitar',6,Array(6).fill(0),0,30,1);
+        assert.equal(score(ordinary).isHit,elapsed<2);
+        assert.equal(score(harmonic).isHit,false);
+        assert.equal(score(harmonic).totalStrings,1);
+    }
+});
+test('unsupported or malformed slide combinations do not move the contact target',()=>{
+    const n=note();n.f=4;n.sl=7;n.slide_interval={start:1,end:2};
+    for(const patch of [{sl:true},{sl:0},{sl:25},{slu:6},{slide_interval:{start:.1,end:2}},
+        {slide_interval:{start:1,end:3}},{slide_interval:{start:1,end:2,extra:true}},
+        {bnv:[{t:0,v:0}]},{bt:2},{slide_out:'up'},{whammy:{}},{ho:true},{vb:true},{tr:true}]) {
+        assert.equal(h._ndContactSustainFret({...n,...patch},1.5),4+12*Math.log2(3));
+    }
+});
+test('early, short and descending contact slides use the same bounded trajectory',()=>{
+    for(const [f,sl,start,end] of [[4,7,.2,.201],[12,7,.2,1.9],[7,10,1.99,2]]) {
+        const n={...note(),f,sl,slide_interval:{start,end}};
+        const half=(start+end)/2,interval=12*Math.log2(3);
+        assert.ok(Math.abs(h._ndContactSustainFret(n,half)-(f+(sl-f)*Math.SQRT1_2**3+interval))<1e-9);
+        assert.equal(h._ndContactSustainFret(n,start),f+interval);
+        assert.equal(h._ndContactSustainFret(n,end),sl+interval);
+        assert.equal(h._ndContactSustainFret(n,.15),f+interval);
+    }
+});
 test('sustain grace cannot cross a contact or accept the wrong octave/partial',()=>{
     const helpers=names.concat(['_ndScoringFret','_ndMidiFromStringFret','_ndStandardMidiFor','_ndPreciseHarmonic',
         '_ndNearestOctaveCents','_ndFoldOctaveCents']);
