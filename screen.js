@@ -2992,6 +2992,8 @@ function createNoteDetector(options = {}) {
     let mergerNode = null;
     let worklet = null;
     let levelAnalyser = null;
+    let rawInputAnalyser = null;
+    let rawInputMeterBuffer = null;
 
     // Settings — seed from localStorage defaults (shared with singleton),
     // then override from options where provided. Only the default
@@ -4975,6 +4977,13 @@ function createNoteDetector(options = {}) {
             levelAnalyser.smoothingTimeConstant = 0.8;
             gainNode.connect(levelAnalyser);
 
+            // Calibration needs physical input peaks, independent of the gain
+            // and the decorative RMS meter. Tap the selected channel pre-gain.
+            rawInputAnalyser = audioCtx.createAnalyser();
+            // Overlap the 120 ms calibration polls, including at 192 kHz.
+            rawInputAnalyser.fftSize = 32768;
+            (mergerNode || sourceNode).connect(rawInputAnalyser);
+
             const processor = audioCtx.createScriptProcessor(frameSize, 1, 1);
             worklet = processor;
             accumBuffer = new Float32Array(0);
@@ -5287,6 +5296,11 @@ function createNoteDetector(options = {}) {
             try { levelAnalyser.disconnect(); } catch (e) {}
             levelAnalyser = null;
         }
+        if (rawInputAnalyser) {
+            try { rawInputAnalyser.disconnect(); } catch (_) {}
+            rawInputAnalyser = null;
+        }
+        rawInputMeterBuffer = null;
         if (gainNode) {
             try { gainNode.disconnect(); } catch (e) {}
             gainNode = null;
@@ -8240,18 +8254,34 @@ function createNoteDetector(options = {}) {
         renderCalibrationWizard();
     }
 
+    function _calWizardLevelSample() {
+        if (!usingDesktopBridge && rawInputAnalyser) {
+            if (!rawInputMeterBuffer || rawInputMeterBuffer.length !== rawInputAnalyser.fftSize)
+                rawInputMeterBuffer = new Float32Array(rawInputAnalyser.fftSize);
+            rawInputAnalyser.getFloatTimeDomainData(rawInputMeterBuffer);
+            let sum = 0, peak = 0;
+            for (const value of rawInputMeterBuffer) {
+                sum += value * value;
+                peak = Math.max(peak, Math.abs(value));
+            }
+            return {level: 100 * Math.sqrt(sum / rawInputMeterBuffer.length), peak: 100 * peak, raw: true};
+        }
+        const snap = getCalibrationSnapshot();
+        return {level: snap.inputLevelRawPct ?? snap.inputLevelPct, peak: snap.inputPeakPct, raw: false};
+    }
+
     function _calWizardRunLevelSampler(wiz, kind, durationMs, onDone) {
         _calWizardStopAutoCapture();
         const samples = [];
         const started = Date.now();
         wiz.autoCapture = { kind, phase: 'listening', samples, started };
         const tick = () => {
-            const snap = getCalibrationSnapshot();
-            samples.push({ level: snap.inputLevelPct, peak: snap.inputPeakPct, t: Date.now() });
+            const sample = _calWizardLevelSample();
+            samples.push({ ...sample, t: Date.now() });
             const elapsed = Date.now() - started;
             _calWizardSetAutoStatus(
                 `<span class="text-cyan-300/90">Listening…</span> ${Math.round(elapsed / 1000)}s / ${Math.round(durationMs / 1000)}s · `
-                + calibrationFormatLevel(snap.inputLevelPct, snap.inputPeakPct));
+                + calibrationFormatLevel(sample.level, sample.peak));
             if (elapsed >= durationMs) {
                 _calWizardStopAutoCapture();
                 onDone(samples);
@@ -8364,7 +8394,8 @@ function createNoteDetector(options = {}) {
         if (!wiz || wiz.step !== 4 || wiz.gainReadPending) return;
         if (!_calWizardHasRawInput(wiz)) {
             const el = _calWizardEl?.querySelector('.nd-cal-gain-preview');
-            const raw = (inputLevel || 0) / (inputGain || 1);
+            const sample = _calWizardLevelSample();
+            const raw = sample.peak / 100 / (sample.raw ? 1 : (inputGain || 1));
             const adjusted = raw * (wiz.gainDraft ?? inputGain);
             if (el) el.textContent = `Playing level preview: ${(adjusted * 100).toFixed(1)}%${adjusted >= 1 ? ' · Lower gain to leave headroom' : ''}`;
             return;
@@ -8406,6 +8437,8 @@ function createNoteDetector(options = {}) {
                 if ((s.channels.find(c => c.index === s.selected)?.peak || 0) >= 0.98)
                     throw new Error(_ndInputGainWarning(1, 1));
             }
+            else if (rawInputAnalyser && _calWizardLevelSample().peak >= 98)
+                throw new Error(_ndInputGainWarning(1, 1));
             const gain = Math.max(0.1, Math.min(5, wiz.gainDraft ?? engineInputGain ?? inputGain));
             await _ndSaveInputGain(gain, wiz.profileContext, {
                 rawPeak: wiz.signal?.rawPeak,
@@ -8461,10 +8494,10 @@ function createNoteDetector(options = {}) {
         // path so a *failed* unity-set isn't mis-measured against the web gain
         // (which isn't in the engine signal path). On the engine path: force unity
         // and record 1.0 (or null if it didn't take → the recommendation bails).
-        // On the browser path: no engine bridge, so the peak reflects the current
-        // web gain (`inputGain`), which the recommendation divides back out.
+        // Browser calibration reads its own pre-gain waveform tap, also at unity.
+        // Keep the old gain basis only for hosts without that raw browser tap.
         wiz._onEnginePath = !!_ndResolveAudioBridge();
-        wiz._measuredAtGain = wiz._onEnginePath
+        wiz._measuredAtGain = rawInputAnalyser && !usingDesktopBridge ? 1 : wiz._onEnginePath
             ? (_ndSetEngineGain(1.0) ? 1.0 : null)
             : inputGain;
         _calWizardBeginCountdownThen('signal', 3, () => {
@@ -8474,29 +8507,29 @@ function createNoteDetector(options = {}) {
             const maxWait = 12000;
             wiz.autoCapture = { kind: 'signal', phase: 'wait_signal', samples, started };
             const tick = () => {
-                const s = getCalibrationSnapshot();
-                const lvl = s.inputLevelRawPct ?? s.inputLevelPct;
+                const sample = _calWizardLevelSample();
+                const lvl = sample.level;
                 const elapsed = Date.now() - started;
                 if (lvl >= trigger && wiz.autoCapture.phase === 'wait_signal') {
                     wiz.autoCapture.phase = 'listening';
                     wiz.autoCapture.signalStarted = Date.now();
-                    _calWizardSetAutoStatus('<span class="text-cyan-300/90">Signal detected — listening…</span> Play open low E.');
+                    _calWizardSetAutoStatus('<span class="text-cyan-300/90">Signal detected — keep playing your strongest normal strums.</span>');
                 }
                 if (wiz.autoCapture.phase === 'listening') {
-                    samples.push({ level: lvl, peak: lvl, t: Date.now() });
+                    samples.push({ level: lvl, peak: sample.raw ? sample.peak : lvl, t: Date.now() });
                     const listenFor = Date.now() - (wiz.autoCapture.signalStarted || started);
                     _calWizardSetAutoStatus(
                         `<span class="text-cyan-300/90">Listening…</span> ${Math.round(listenFor / 1000)}s · `
-                        + calibrationFormatLevel(lvl, s.inputPeakPct));
-                    if (listenFor >= 1600) {
+                        + calibrationFormatLevel(lvl, sample.peak));
+                    if (listenFor >= 3200) {
                         _calWizardStopAutoCapture();
                         _calWizardFinishLevelSample(wiz, 'signal', samples);
                         return;
                     }
                 } else {
                     _calWizardSetAutoStatus(
-                        `<span class="text-cyan-300/90">Waiting for signal…</span> Play open low E (need ≥${trigger}%). `
-                        + calibrationFormatLevel(lvl, s.inputPeakPct));
+                        `<span class="text-cyan-300/90">Waiting for signal…</span> Play your strongest normal strums (need ≥${trigger}%). `
+                        + calibrationFormatLevel(lvl, sample.peak));
                     if (elapsed >= maxWait) {
                         _calWizardStopAutoCapture();
                         _calWizardSetAutoStatus('<span class="text-amber-200/90">Timeout — no signal detected. Retry when ready.</span>');
@@ -9566,7 +9599,8 @@ function createNoteDetector(options = {}) {
 
     function _calWizardDetectBanner(snap) {
         if (snap && snap.enabled) return '';
-        return '<p class="nd-cal-detect-warn text-amber-200/90 text-xs mb-2">Turn Detect on first for live input and timing checks.</p>';
+        return '<p class="nd-cal-detect-warn text-amber-200/90 text-xs mb-2">Enable Detect for live input and timing checks. If input startup failed, select and start your audio input, then retry here.</p>'
+            + '<button type="button" class="nd-cal-enable-detect w-full py-2 bg-accent rounded-lg text-xs font-semibold text-white mb-2">Enable Detect / retry input</button>';
     }
 
     function _calWizardRefreshLive() {
@@ -9973,6 +10007,7 @@ function createNoteDetector(options = {}) {
         }
         if (wiz.profileName) html = `<p class="text-gray-300 text-xs mb-2"><strong>${_ndEscapeHtml(wiz.profileName)}</strong>${wiz.profileRoute ? ` · ${_ndEscapeHtml(wiz.profileRoute)}` : ''}</p>` + html;
         if (wiz.gainError) html = `<p class="text-amber-200 text-xs mb-2" role="alert">${_ndEscapeHtml(wiz.gainError)}</p>` + html;
+        if (wiz.detectError) html = `<p class="text-amber-200 text-xs mb-2" role="alert">${_ndEscapeHtml(wiz.detectError)}</p>` + html;
         if (wiz.levelsOnly && step === 3) html = '<p class="text-gray-300 text-xs mb-2">Use your usual pickup and guitar volume settings. Keep the interface gain knob unchanged after calibration.</p>' + html;
         if (wiz.profilePending || wiz.profileError) {
             html = `<p class="text-amber-200 text-xs mb-2" role="status">${_ndEscapeHtml(wiz.profileError || 'Loading guitar and audio input…')}</p>` + html;
@@ -9982,6 +10017,18 @@ function createNoteDetector(options = {}) {
         if (wiz.profilePending || wiz.profileError) {
             body.querySelectorAll('button, input, select').forEach(el => { el.disabled = true; });
         }
+
+        const enableDetect = body.querySelector('.nd-cal-enable-detect');
+        if (enableDetect) enableDetect.onclick = async () => {
+            enableDetect.disabled = true;
+            wiz.detectError = null;
+            try {
+                if (!await enable()) wiz.detectError = 'Input could not start. Check your audio device settings, then retry.';
+            } catch (error) { wiz.detectError = error.message || String(error); }
+            finally {
+                if (_calWizardState === wiz) renderCalibrationWizard();
+            }
+        };
 
         const openTuner = body.querySelector('.nd-cal-open-tuner');
         if (openTuner) {

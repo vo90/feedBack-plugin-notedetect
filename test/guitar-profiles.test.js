@@ -5,7 +5,7 @@ const { loadDetectionCore } = require('./_loader');
 const flush = async () => { for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve)); };
 
 function setup({ profiles = true, browser = false, pendingReady = false, initialRunning = true } = {}) {
-    let sb, overlay, panel, peak = 0.001, sequence = 0;
+    let sb, overlay, panel, peak = 0.001, sequence = 0, now = 100000;
     let inputRunning = initialRunning, selected = initialRunning ? 0 : -1;
     const writes = [], nativeWrites = [], gainNodes = [], timers = new Map(), listeners = new Set(), intervals = [];
     let timerId = 0;
@@ -43,6 +43,7 @@ function setup({ profiles = true, browser = false, pendingReady = false, initial
     };
     const core = loadDetectionCore({ sandboxBeforeRun(s) {
         sb = s;
+        s.Date = class extends Date { static now() { return now; } };
         s.setTimeout = (fn, ms) => {
             const id = ++timerId;
             timers.set(id, fn);
@@ -51,6 +52,7 @@ function setup({ profiles = true, browser = false, pendingReady = false, initial
         };
         s.clearTimeout = id => timers.delete(id);
         s.setInterval = (fn, ms) => { intervals.push({ fn, ms }); return intervals.length; };
+        s.clearInterval = id => { if (intervals[id - 1]) intervals[id - 1].cleared = true; };
         s.document = {
             querySelector() { return null; }, querySelectorAll() { return []; },
             getElementById() { return null; }, addEventListener() {},
@@ -63,7 +65,11 @@ function setup({ profiles = true, browser = false, pendingReady = false, initial
         s.localStorage.getItem = key => key === 'slopsmith_notedetect' ? JSON.stringify({ inputGain: 4, engineInputGain: 4, detectEnabled: false }) : null;
         if (profiles) s.feedBack = { guitarProfiles: service };
         if (browser) {
-            const node = () => ({ connect() {}, disconnect() {}, channelCount: 1, gain: { value: 0 }, getFloatTimeDomainData() {} });
+            const node = () => ({ connect(target) { target.upstream = this; }, disconnect() {}, channelCount: 1, gain: { value: 0 },
+                getFloatTimeDomainData(buffer) {
+                    const multiplier = gainNodes.includes(this.upstream) ? this.upstream.gain.value : 1;
+                    for (let i = 0; i < buffer.length; i++) buffer[i] = peak * multiplier * Math.sin(i * Math.PI / 16);
+                } });
             s.AudioContext = class {
                 sampleRate = 48000;
                 destination = node();
@@ -95,7 +101,8 @@ function setup({ profiles = true, browser = false, pendingReady = false, initial
         sb, det, service, state, writes, nativeWrites, gainNodes, listeners, intervals, resolveReady: () => resolveReady(),
         change(next) { Object.assign(state, next); state.revision++; for (const fn of listeners) fn({ ...state }); },
         startInput() { inputRunning = true; this.change({ routeKey: `interface:${selected}`, routeLabel: 'Interface' }); },
-        async refreshWizard() { for (const timer of intervals) if (timer.ms === 200) timer.fn(); await flush(); },
+        async refreshWizard() { for (const timer of intervals) if (!timer.cleared && timer.ms === 200) timer.fn(); await flush(); },
+        async tickSampler(ms) { now += ms; for (const timer of [...intervals]) if (!timer.cleared && timer.ms === 120) timer.fn(); await flush(); },
         setPeak(value) { peak = value; },
         get overlay() { return overlay; }, get body() { return overlay.querySelector('.nd-cal-body'); },
         async open(short = true) {
@@ -177,6 +184,51 @@ test('native detection does not start when the selected route calibration cannot
     assert.deepEqual(s.nativeWrites, []);
     s.det.destroy();
 });
+
+test('failed initial startup offers an in-wizard Detect retry after input setup', async () => {
+    const s = setup({ initialRunning: false });
+    s.service.refresh = async () => ({ ...s.state, applied: !!s.state.routeKey });
+    await s.det.launchGuitarCalibration();
+    await flush();
+    assert.match(s.body.innerHTML, /Enable Detect \/ retry input/);
+    s.startInput();
+    await s.refreshWizard();
+    await s.body.querySelector('.nd-cal-enable-detect').onclick();
+    assert.doesNotMatch(s.body.innerHTML, /Enable Detect \/ retry input/);
+    const channel = s.body.querySelector('.nd-cal-native-channel');
+    channel.value = '0'; channel.onchange();
+    await s.body.querySelector('.nd-cal-use-channel').onclick();
+    s.overlay.querySelector('.nd-cal-next').onclick();
+    await s.body.querySelector('.nd-cal-start-noise').onclick(); await flush();
+    assert.match(s.body.innerHTML, /Captured: avg/);
+    s.det.destroy();
+});
+
+for (const [gain, rawPeak, recommended] of [[1, 0.1, 2.5], [4, 0.1, 2.5], [4, 0.35, 0.71], [4, 0.99, null]]) {
+    test(`browser calibration measures raw sine peak ${rawPeak} independently of current ${gain}x boost`, async () => {
+        const s = setup({ browser: true });
+        s.change({ gain });
+        await s.det.enable();
+        await s.open();
+        await s.body.querySelector('.nd-cal-start-noise').onclick(); await flush();
+        await s.tickSampler(2000);
+        s.overlay.querySelector('.nd-cal-next').onclick();
+        s.setPeak(rawPeak);
+        await s.body.querySelector('.nd-cal-start-signal').onclick(); await flush();
+        await s.tickSampler(3400);
+        await s.body.querySelector('.nd-cal-save-gain').onclick();
+        if (recommended == null) {
+            assert.match(s.body.innerHTML, /clipping before game gain/);
+            assert.equal(s.writes.length, 0);
+        } else {
+            assert.equal(s.writes[0].gain, recommended);
+            assert.ok(Math.abs(s.writes[0].metadata.rawPeak - rawPeak) < 1e-6);
+            assert.ok(Math.abs(s.writes[0].metadata.noisePeak - 0.001) < 1e-6);
+            assert.equal(s.gainNodes.at(-1).gain.value, recommended);
+        }
+        s.det.destroy();
+    });
+}
 
 test('full setup can choose an input before capture and applies its gain through the same profile service', async () => {
     const s = setup();
