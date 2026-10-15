@@ -3095,7 +3095,7 @@ function createNoteDetector(options = {}) {
             if (changed) {
                 if (!wiz.profileLocked && context.profileId === snapshot.activeId) wiz.profileContext = null;
                 else {
-                    wiz.profileError = 'Guitar or audio input changed. Close this calibration and start again.';
+                    wiz.profileError = 'Instrument or audio input changed. Close this calibration and start again.';
                     _calWizardStopAutoCapture();
                 }
                 if (_calWizardEl) renderCalibrationWizard();
@@ -7978,14 +7978,28 @@ function createNoteDetector(options = {}) {
         const profiles = await _ndSyncGuitarProfile();
         if (_calWizardState !== wiz) throw new Error('Calibration cancelled.');
         if (wiz.profileError) throw new Error(wiz.profileError);
+        if (wiz.measurementOnly) {
+            if (!profiles?.verifyDraftContext) throw new Error('Instrument setup needs the updated instrument profiles service.');
+            await profiles.refresh();
+            if (_calWizardState !== wiz) throw new Error('Calibration cancelled.');
+            const context = profiles.verifyDraftContext(wiz.draftContext, {
+                bindRoute: !wiz.profileLocked, requireRoute: lock,
+            });
+            if (_calWizardState !== wiz) throw new Error('Calibration cancelled.');
+            wiz.draftContext = context;
+            wiz.profileRoute = context.routeLabel || profiles.getSnapshot().routeLabel;
+            if (lock) wiz.profileLocked = true;
+            return;
+        }
         if (profiles) {
+            wiz.instrumentType = wiz.requestedInstrument || profiles.getSnapshot().activeType || wiz.instrumentType;
             // First-time setup must still let the player start/select an input.
             // Keep the guitar identity now; bind the route when measuring starts.
             const keepUnselectedInput = () => {
                 const snapshot = profiles.getSnapshot();
                 if (lock || wiz.profileLocked || snapshot.routeKey) return false;
                 if (wiz.profileId && wiz.profileId !== snapshot.activeId)
-                    throw new Error('Guitar changed. Close this calibration and start again.');
+                    throw new Error('Instrument changed. Close this calibration and start again.');
                 wiz.profileId = snapshot.activeId;
                 wiz.profileName = snapshot.activeName;
                 wiz.profileRoute = snapshot.routeLabel;
@@ -8004,10 +8018,10 @@ function createNoteDetector(options = {}) {
             if (_calWizardState !== wiz) throw new Error('Calibration cancelled.');
             if (wiz.profileError) throw new Error(wiz.profileError);
             if (wiz.profileId && wiz.profileId !== context.profileId)
-                throw new Error('Guitar changed. Close this calibration and start again.');
+                throw new Error('Instrument changed. Close this calibration and start again.');
             if (wiz.profileLocked && wiz.profileContext && (wiz.profileContext.routeKey !== context.routeKey
                 || wiz.profileContext.revision !== context.revision))
-                throw new Error('Guitar or audio input changed. Close this calibration and start again.');
+                throw new Error('Instrument or audio input changed. Close this calibration and start again.');
             wiz.profileId = context.profileId;
             wiz.profileContext = context;
             wiz.profileName = context.activeName || profiles.getSnapshot().activeName;
@@ -8021,7 +8035,8 @@ function createNoteDetector(options = {}) {
         try {
             await _calWizardBindProfile(wiz);
             if (wiz.levelsOnly) {
-                if (_ndGuitarProfiles() && !wiz.profileContext) wiz.step = 1;
+                const context = wiz.measurementOnly ? wiz.draftContext : wiz.profileContext;
+                if (_ndGuitarProfiles() && !context?.routeKey) wiz.step = 1;
                 const audio = _ndResolveAudioBridge();
                 if (audio?.getInputChannelSnapshot) {
                     const snapshot = await audio.getInputChannelSnapshot();
@@ -8031,7 +8046,7 @@ function createNoteDetector(options = {}) {
                     if (!snapshot?.running || !(snapshot.selected >= 0)) wiz.step = 1;
                 }
                 // Channel selection can still change the route before measuring.
-                if (wiz.step !== 1) wiz.profileLocked = true;
+                if (wiz.step !== 1 && !wiz.measurementOnly) wiz.profileLocked = true;
             }
         } catch (error) {
             if (_calWizardState === wiz) wiz.profileError = error.message;
@@ -8364,8 +8379,9 @@ function createNoteDetector(options = {}) {
                     sampleCount: kind === 'signal' ? 40 : 20,
                     expectedIdentity: _ndInputMeasurementKey(s), cancelled,
                     onProgress: ({ listening, peak, count }) => {
+                        const playing = wiz.instrumentType === 'bass' ? 'notes or plucks' : 'strums or notes';
                         const instruction = kind === 'noise' ? 'KEEP STRINGS MUTED'
-                            : listening ? 'KEEP PLAYING — include your strongest strums' : 'PLAY NOW — use your strongest normal strums';
+                            : listening ? `KEEP PLAYING — include your strongest ${playing}` : `PLAY NOW — use your strongest normal ${playing}`;
                         _calWizardSetAutoStatus(`<strong class="text-cyan-300">${instruction}</strong><br>`
                             + `Raw peak ${(peak * 100).toFixed(2)}%${listening ? ` · ${Math.round(count / (kind === 'signal' ? 40 : 20) * 100)}% captured` : ''}`);
                     },
@@ -8440,18 +8456,29 @@ function createNoteDetector(options = {}) {
             else if (rawInputAnalyser && _calWizardLevelSample().peak >= 98)
                 throw new Error(_ndInputGainWarning(1, 1));
             const gain = Math.max(0.1, Math.min(5, wiz.gainDraft ?? engineInputGain ?? inputGain));
-            await _ndSaveInputGain(gain, wiz.profileContext, {
+            const metadata = {
                 rawPeak: wiz.signal?.rawPeak,
                 noisePeak: wiz.noise?.peakPct / 100,
                 measuredAt: new Date().toISOString(), method: 'guided-level-v1',
-            }, () => _calWizardState !== wiz);
+            };
+            if (wiz.measurementOnly) {
+                if (!wiz.signal?.captured || !Number.isFinite(wiz.gainDraft))
+                    throw new Error('Capture your playing level before using this calibration.');
+                // Return a proposal only. Core creates the instrument and applies
+                // its gain after the player's final Save in the parent flow.
+                await _calWizardBindProfile(wiz, true);
+                wiz.measurementResult = {gain, metadata, context: wiz.draftContext};
+                calibrationWizardClose();
+                return;
+            }
+            await _ndSaveInputGain(gain, wiz.profileContext, metadata, () => _calWizardState !== wiz);
             if (_calWizardState !== wiz) return;
             const profiles = _ndGuitarProfiles();
             if (profiles) {
                 const context = await profiles.captureContext();
                 if (_calWizardState !== wiz) return;
                 if (context.profileId !== wiz.profileContext.profileId || context.routeKey !== wiz.profileContext.routeKey)
-                    throw new Error('Guitar or audio input changed. Close this calibration and start again.');
+                    throw new Error('Instrument or audio input changed. Close this calibration and start again.');
                 wiz.profileContext = context;
             }
             wiz.gainDraft = gain;
@@ -8546,18 +8573,23 @@ function createNoteDetector(options = {}) {
         const hw = resolveHw();
         let info = null;
         try { info = (hw && hw.getSongInfo) ? hw.getSongInfo() : null; } catch (_) {}
-        const hasTuning = !!(info && Array.isArray(info.tuning) && info.tuning.length > 0);
-        // No real song tuning (onboarding standalone). Priority for what to
-        // calibrate: (1) the user's explicit instrument-config dropdown, then
-        // (2) the launchCalibration() arrangement override, else (3) the
-        // guitar default. _syncChartStateFromHw just reset currentArrangement
-        // to 'guitar', so without these overrides a bass/extended-range player
-        // would silently calibrate a 6-string guitar.
+        // The highway retains its last chart after leaving the player. The
+        // session gate distinguishes that stale chart from a loaded/paused song.
+        const outsideSong = window.feedBack?.instrumentSession?.isLocked?.() === false;
+        const hasTuning = !outsideSong && !!(info && Array.isArray(info.tuning) && info.tuning.length > 0);
+        const selectedType = _calWizardForceArrangement || _calWizardState?.instrumentType
+            || _ndGuitarProfiles()?.getSnapshot()?.activeType;
+        let working = null;
+        try { working = window.feedBack?.workingTuning?.get?.(); } catch (_) { /* Older hosts. */ }
+        const standaloneType = selectedType || working?.instrument;
+        // Without a song, calibrate the explicit string preset first, then the selected game
+        // instrument (or launch override), with the old guitar default only
+        // on hosts that expose neither selection.
         const cfgId = _calWizardState && _calWizardState.selectedInstrumentConfig;
         const cfg = (!hasTuning && cfgId)
             ? _CAL_WIZARD_INSTRUMENT_CONFIGS.find((c) => c.id === cfgId)
             : null;
-        const forced = !hasTuning && !cfg && _calWizardForceArrangement;
+        const forced = !hasTuning && !cfg && standaloneType;
         let arrangement;
         let stringCount;
         if (cfg) {
@@ -8565,15 +8597,21 @@ function createNoteDetector(options = {}) {
             stringCount = cfg.stringCount;
         } else {
             arrangement = forced
-                ? _calWizardForceArrangement
+                ? standaloneType
                 : (currentArrangement || 'guitar');
-            // When forcing a standalone arrangement with no host chart,
-            // _syncChartStateFromHw left currentStringCount at the guitar
-            // default (6); pick the arrangement's own default so a bass
-            // calibration shows 4 strings, not 6 (two of them blank).
+            // The selected game instrument remembers its own string count.
+            // Reject a stale other-instrument value while selection hydrates.
             stringCount = (Number.isFinite(currentStringCount) && currentStringCount > 0)
                 ? currentStringCount : 6;
-            if (forced && _calWizardForceArrangement === 'bass') stringCount = 4;
+            if (forced) {
+                const selectedCount = working?.instrument === arrangement ? working.stringCount : null;
+                const validCounts = arrangement === 'bass' ? [4, 5, 6] : [6, 7, 8];
+                stringCount = validCounts.includes(selectedCount) ? selectedCount : (arrangement === 'bass' ? 4 : 6);
+            }
+        }
+        if (outsideSong && _calWizardState) {
+            currentArrangement = arrangement;
+            currentStringCount = stringCount;
         }
         const offsets = Array.isArray(tuningOffsets) ? tuningOffsets : [0, 0, 0, 0, 0, 0];
         // `preset` is the standalone instrument the user picked (or null). When
@@ -9365,7 +9403,7 @@ function createNoteDetector(options = {}) {
         if (forcedInstrument) currentArrangement = forcedInstrument;
         const start = () => {
             try {
-                openCalibrationWizard({ levelsOnly: !!opts.levelsOnly });
+                openCalibrationWizard({ levelsOnly: !!opts.levelsOnly, instrument: forcedInstrument });
             } catch (e) {
                 if (onCancel) { try { onCancel('error'); } catch (_) { /* isolate */ } }
                 return;
@@ -9396,6 +9434,30 @@ function createNoteDetector(options = {}) {
         } else {
             return start();
         }
+    }
+
+    async function measureInstrumentGain(options = {}) {
+        const type = options.type;
+        if (type !== 'guitar' && type !== 'bass') throw new Error('Choose Guitar or Bass before calibrating.');
+        const profiles = await _ndSyncGuitarProfile();
+        if (!profiles?.captureDraftContext || !profiles?.verifyDraftContext)
+            throw new Error('Instrument setup needs the updated instrument profiles service.');
+        const context = options.context || await profiles.captureDraftContext(type);
+        if (context?.type !== type) throw new Error('The instrument type changed. Start calibration again.');
+        if (guitarProfilesDestroyed) return null;
+        return new Promise(resolve => {
+            openCalibrationWizard({levelsOnly: true, measurement: {
+                type, name: String(options.name || (type === 'bass' ? 'Bass' : 'Guitar')), context, resolve,
+            }});
+            const wiz = _calWizardState;
+            // Open first so the player can cancel while audio startup is pending.
+            void (async () => {
+                try {
+                    if (!enabled && !await enable()) wiz.detectError = 'Input could not start. Check your audio device settings, then retry.';
+                } catch (error) { wiz.detectError = error.message || String(error); }
+                finally { if (_calWizardState === wiz) renderCalibrationWizard(); }
+            })();
+        });
     }
 
     function _calWizardDeviceLabel() {
@@ -9556,6 +9618,9 @@ function createNoteDetector(options = {}) {
         // Capture launchCalibration() callback context before teardown nulls it.
         const _calHadWizard = !!_calWizardEl;
         const _calAppliedResult = (_calWizardState && _calWizardState.applied) || null;
+        const measurementResolve = _calWizardState?.measurementResolve;
+        const measurementResult = _calWizardState?.measurementResult || null;
+        const measurementOnly = !!_calWizardState?.measurementOnly;
         _calWizardStopAllStringsRun('close');
         _calWizardClearPauseRetries();
         _calWizardStopAutoCapture();
@@ -9566,7 +9631,9 @@ function createNoteDetector(options = {}) {
         // No-op when never calibrated (engineInputGain == null).
         _ndApplyEngineGain();
         _calWizardStopTimedPlayAlong('close');
-        _calWizardReleaseTuner();
+        // A measurement-only wizard never opened the tuner. Restarting audio
+        // here would invalidate the route context being returned to Core.
+        if (_calHadWizard && !measurementOnly) _calWizardReleaseTuner();
         if (_calWizardTick) {
             clearInterval(_calWizardTick);
             _calWizardTick = null;
@@ -9577,6 +9644,7 @@ function createNoteDetector(options = {}) {
         }
         _calWizardState = null;
         _calWizardForceArrangement = null;
+        if (measurementResolve) measurementResolve(measurementResult);
         // Fire the one-shot launchCalibration() callbacks: applied settings →
         // done, otherwise → cancel. Only when a wizard was actually open (so the
         // open-time pre-close is a no-op).
@@ -9587,7 +9655,7 @@ function createNoteDetector(options = {}) {
             // wizard's source is opened, and an unguarded close there would wipe
             // the fresh calibration ref. Live detection (if still enabled) keeps
             // its own ND_AUDIO_REQUESTER ref, so the device stays open for play.
-            _ndCloseSelectedInputSource(ND_AUDIO_CAL_REQUESTER);
+            if (!measurementOnly) _ndCloseSelectedInputSource(ND_AUDIO_CAL_REQUESTER);
             const onDone = _calWizardOnDone;
             const onCancel = _calWizardOnCancel;
             _calWizardOnDone = null;
@@ -9774,7 +9842,7 @@ function createNoteDetector(options = {}) {
         const snap = getCalibrationSnapshot();
         const wiz = _calWizardState;
         const meta = _CAL_WIZARD_STEPS[step] || { title: 'Step' };
-        title.textContent = wiz.levelsOnly ? `Calibrate ${wiz.profileName || 'guitar'} — ${meta.title}` : `Calibration Wizard — ${meta.title}`;
+        title.textContent = wiz.levelsOnly ? `Calibrate ${wiz.profileName || 'instrument'} — ${meta.title}` : `Calibration Wizard — ${meta.title}`;
         if (backBtn) backBtn.style.visibility = step > 0 && step < 8 ? 'visible' : 'hidden';
         if (nextBtn) {
             nextBtn.disabled = step === 1 && (wiz.channelProbeRunning || (!!wiz.channelSnapshot
@@ -9793,6 +9861,7 @@ function createNoteDetector(options = {}) {
                 nextBtn.style.display = '';
                 nextBtn.textContent = step === 4 ? 'Done' : 'Next';
                 nextBtn.disabled = step === 3 ? !wiz.noise?.captured : step === 4 ? !wiz.gainSaved : nextBtn.disabled;
+                if (wiz.measurementOnly && step === 4) nextBtn.style.display = 'none';
             }
         }
 
@@ -9843,7 +9912,7 @@ function createNoteDetector(options = {}) {
                 <div class="nd-cal-heard text-cyan-300 text-xs mt-2" role="status">Now hearing: —</div>`;
         } else if (step === 2) {
             html = `
-                <p class="text-gray-300 text-xs mb-2">Tune your guitar using the bottom <strong class="text-gray-200">Tuner</strong> panel.</p>
+                <p class="text-gray-300 text-xs mb-2">Tune your ${wiz.instrumentType === 'bass' ? 'bass' : 'instrument'} using the bottom <strong class="text-gray-200">Tuner</strong> panel.</p>
                 <p class="text-[10px] text-gray-500 mb-2">The tuner opens automatically and hides this wizard. Tap <strong>Return to Calibration Wizard</strong> when done — or use <strong>Open Tuner</strong> below to reopen it.</p>
                 <p class="text-[10px] text-amber-200/80">If notes miss often later: retune here before continuing.</p>
                 <button type="button" class="nd-cal-open-tuner w-full mb-2 py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200">Open Tuner</button>
@@ -9864,7 +9933,7 @@ function createNoteDetector(options = {}) {
             const sDone = wiz.signal && wiz.signal.captured;
             html = `
                 ${_calWizardDetectBanner(snap)}
-                <p class="text-gray-300 text-xs mb-2">When prompted, play several of your strongest normal strums or notes. Keep playing until capture finishes.</p>
+                <p class="text-gray-300 text-xs mb-2">When prompted, play several of your strongest normal ${wiz.instrumentType === 'bass' ? 'bass notes or plucks' : 'strums or notes'}. Keep playing until capture finishes.</p>
                 <div class="nd-cal-live-level text-cyan-300/90 text-xs font-mono mb-2">Live: —</div>
                 <div class="nd-cal-auto-status text-[11px] text-gray-400 mb-2 h-[2.75rem] overflow-y-auto">${sDone
                     ? `Captured: avg ${wiz.signal.avgPct}% · peak ${wiz.signal.peakPct}% · ${_calWizardSignalStatusDisplay(wiz.signal.status)}`
@@ -9876,8 +9945,8 @@ function createNoteDetector(options = {}) {
                     <label class="block text-gray-200 text-xs mb-2" for="nd-cal-input-gain">Game input gain: <strong class="nd-cal-gain-value">${_calWizardFmtGain(wiz.gainDraft ?? engineInputGain ?? inputGain)}</strong></label>
                     <input id="nd-cal-input-gain" class="nd-cal-input-gain w-full" type="range" min="0.1" max="5" step="0.01" value="${wiz.gainDraft ?? engineInputGain ?? inputGain}">
                     <p class="nd-cal-gain-preview text-xs text-cyan-300 my-2" role="status">Reading input…</p>
-                    <p class="text-xs text-gray-400 mb-2">Preview the level while playing. Applies to note detection and in-game guitar effects. Leave headroom for your strongest strums.</p>
-                    <button type="button" class="nd-cal-save-gain w-full py-2 bg-accent rounded-lg text-xs font-semibold text-white" ${wiz.signal?.clipped || (wiz.levelsOnly && !wiz.signal?.captured) ? 'disabled' : ''}>Apply and save gain</button>
+                    <p class="text-xs text-gray-400 mb-2">${wiz.measurementOnly ? 'This level will be applied when you save the instrument. ' : 'Preview the level while playing. Applies to note detection and in-game effects. '}Leave headroom for your strongest playing.</p>
+                    <button type="button" class="nd-cal-save-gain w-full py-2 bg-accent rounded-lg text-xs font-semibold text-white" ${wiz.signal?.clipped || (wiz.levelsOnly && !wiz.signal?.captured) ? 'disabled' : ''}>${wiz.measurementOnly ? 'Use calibration' : 'Apply and save gain'}</button>
                     ${wiz.gainSaved ? '<p class="text-xs text-green-300 mt-2">Input gain saved.</p>' : ''}
                 </div>` : '<p class="text-[10px] text-gray-500">For a quiet signal, adjust input gain. If clipping, lower gain. On desktop, choose an individual channel in Audio Input to preview and save game gain here.</p>'}`;
         } else if (step === 5) {
@@ -9892,7 +9961,7 @@ function createNoteDetector(options = {}) {
                 <div class="nd-cal-instrument-picker mb-2 p-2 bg-dark-700 rounded-lg border border-gray-700">
                     <label class="block text-[11px] text-gray-300 mb-1">Your instrument <span class="text-gray-500">(no song loaded)</span></label>
                     <select class="nd-cal-instrument-config w-full bg-dark-600 border border-gray-600 rounded px-2 py-1 text-xs text-gray-200">
-                        <option value="">— Auto (6-string guitar) —</option>
+                        <option value="">— Auto (${_calCtx.stringCount}-string ${_calCtx.arrangement}) —</option>
                         ${_instrOpts}
                     </select>
                     <p class="text-[9px] text-gray-500 mt-1">Pick a 4/5/6-string bass or 6/7/8-string guitar so the open-string targets match your instrument.</p>
@@ -9951,7 +10020,7 @@ function createNoteDetector(options = {}) {
             html = `
                 ${_calWizardDetectBanner(snap)}
                 <p class="text-gray-300 text-xs mb-2">Quick check that Slopsmith hears open strings. This is simpler than Technique Assessment — just confirms basic detection works.</p>
-                <p class="text-[10px] text-gray-500 mb-2">Targets match the current song tuning. Use the same tone and pitch-shift path you will play the song with.</p>
+                <p class="text-[10px] text-gray-500 mb-2">${_calCtx.hasTuning ? 'Targets match the current song tuning. Use the same tone and pitch-shift path you will play the song with.' : 'Targets use standard tuning for your selected instrument and string count.'}</p>
                 <p class="text-[10px] text-gray-500 mb-2">Load a song first for song tuning in the tuner.</p>
                 ${instrumentPickerHtml}
                 <div class="nd-cal-heard text-cyan-300/90 text-[10px] font-mono mb-2 h-[2rem] overflow-y-auto">Now hearing: —</div>
@@ -10005,12 +10074,12 @@ function createNoteDetector(options = {}) {
                 <button type="button" class="nd-cal-finish-no-apply w-full py-2.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-sm text-gray-300">Finish Without Applying</button>`;
             }
         }
-        if (wiz.profileName) html = `<p class="text-gray-300 text-xs mb-2"><strong>${_ndEscapeHtml(wiz.profileName)}</strong>${wiz.profileRoute ? ` · ${_ndEscapeHtml(wiz.profileRoute)}` : ''}</p>` + html;
+        if (wiz.profileName) html = `<p class="text-gray-300 text-xs mb-2"><strong>${_ndEscapeHtml(wiz.profileName)}</strong>${wiz.instrumentType ? ` · ${wiz.instrumentType === 'bass' ? 'Bass' : 'Guitar'}` : ''}${wiz.profileRoute ? ` · ${_ndEscapeHtml(wiz.profileRoute)}` : ''}</p>` + html;
         if (wiz.gainError) html = `<p class="text-amber-200 text-xs mb-2" role="alert">${_ndEscapeHtml(wiz.gainError)}</p>` + html;
         if (wiz.detectError) html = `<p class="text-amber-200 text-xs mb-2" role="alert">${_ndEscapeHtml(wiz.detectError)}</p>` + html;
-        if (wiz.levelsOnly && step === 3) html = '<p class="text-gray-300 text-xs mb-2">Use your usual pickup and guitar volume settings. Keep the interface gain knob unchanged after calibration.</p>' + html;
+        if (wiz.levelsOnly && step === 3) html = '<p class="text-gray-300 text-xs mb-2">Use your usual pickup and instrument volume settings. Keep the interface gain knob unchanged after calibration.</p>' + html;
         if (wiz.profilePending || wiz.profileError) {
-            html = `<p class="text-amber-200 text-xs mb-2" role="status">${_ndEscapeHtml(wiz.profileError || 'Loading guitar and audio input…')}</p>` + html;
+            html = `<p class="text-amber-200 text-xs mb-2" role="status">${_ndEscapeHtml(wiz.profileError || 'Loading instrument and audio input…')}</p>` + html;
             if (nextBtn) nextBtn.disabled = true;
         }
         body.innerHTML = html;
@@ -10254,6 +10323,15 @@ function createNoteDetector(options = {}) {
         _calWizardState = _calWizardNewState();
         _calWizardState.levelsOnly = !!options.levelsOnly;
         _calWizardState.profileId = _ndGuitarProfiles()?.getSnapshot()?.activeId || null;
+        _calWizardState.requestedInstrument = options.instrument || null;
+        _calWizardState.instrumentType = options.measurement?.type || options.instrument
+            || _ndGuitarProfiles()?.getSnapshot()?.activeType || window.feedBack?.workingTuning?.get?.()?.instrument || null;
+        if (options.measurement) {
+            _calWizardState.measurementOnly = true;
+            _calWizardState.draftContext = options.measurement.context;
+            _calWizardState.measurementResolve = options.measurement.resolve;
+            _calWizardState.profileName = options.measurement.name;
+        }
         if (_calWizardState.levelsOnly) _calWizardState.step = 3;
         _calWizardState.profilePending = !!_ndGuitarProfiles() || _calWizardState.levelsOnly;
         const overlay = document.createElement('div');
@@ -19087,6 +19165,7 @@ function createNoteDetector(options = {}) {
         openCalibrationWizard,
         launchCalibration,
         launchGuitarCalibration: (options = {}) => launchCalibration({ ...options, levelsOnly: true }),
+        measureInstrumentGain,
         closeCalibrationWizard: calibrationWizardClose,
         _hasCalibrationPlaybackHandoff: () => !!(_calWizardState?.step === 6 && _calWizardState.tunerMinimized),
         openInstrumentCalibrationLab,

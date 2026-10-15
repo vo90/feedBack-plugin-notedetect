@@ -9,7 +9,7 @@ function setup({ profiles = true, browser = false, pendingReady = false, initial
     let inputRunning = initialRunning, selected = initialRunning ? 0 : -1;
     const writes = [], nativeWrites = [], gainNodes = [], timers = new Map(), listeners = new Set(), intervals = [];
     let timerId = 0;
-    const state = { activeId: 'default', activeName: 'Default', routeKey: 'interface:0', routeLabel: 'Interface · Input 1', gain: 1.7, revision: 1 };
+    const state = { activeId: 'default', activeName: 'Default', routeKey: 'interface:0', routeLabel: 'Interface · Input 1', gain: 1.7, revision: 1, stateRevision: 1 };
     if (!initialRunning) { state.routeKey = ''; state.routeLabel = 'Start your audio input'; }
     let resolveReady;
     const service = {
@@ -20,11 +20,23 @@ function setup({ profiles = true, browser = false, pendingReady = false, initial
             if (!state.routeKey) throw Error('Start and select your audio input before calibrating.');
             return { profileId: state.activeId, activeName: state.activeName, routeKey: state.routeKey, routeLabel: state.routeLabel, revision: state.revision };
         },
+        async captureDraftContext(type) {
+            return {type, profileId: state.activeId, routeKey: state.routeKey, routeLabel: state.routeLabel,
+                revision: state.revision, stateRevision: state.stateRevision};
+        },
+        verifyDraftContext(context, {bindRoute = false, requireRoute = false} = {}) {
+            if (!context || context.profileId !== state.activeId || context.stateRevision !== state.stateRevision || state.sessionLocked)
+                throw Error('Instrument or session changed. Start again.');
+            if (!bindRoute && (context.routeKey !== state.routeKey || context.revision !== state.revision))
+                throw Error('Audio input changed. Start again.');
+            if (requireRoute && !state.routeKey) throw Error('Start and select your audio input before calibrating.');
+            return {...context, routeKey: state.routeKey, routeLabel: state.routeLabel, revision: state.revision};
+        },
         async saveGain(gain, context, metadata) {
             if (context.profileId !== state.activeId || context.routeKey !== state.routeKey || context.revision !== state.revision)
                 throw Error('Guitar or input changed');
             writes.push({ gain, context, metadata });
-            state.gain = gain; state.revision++;
+            state.gain = gain; state.revision++; state.stateRevision++;
             for (const listener of listeners) listener({ ...state });
             return { ...state };
         },
@@ -99,7 +111,11 @@ function setup({ profiles = true, browser = false, pendingReady = false, initial
     const det = sb.noteDetect || core.createNoteDetector({ isDefault: true });
     return {
         sb, det, service, state, writes, nativeWrites, gainNodes, listeners, intervals, resolveReady: () => resolveReady(),
-        change(next) { Object.assign(state, next); state.revision++; for (const fn of listeners) fn({ ...state }); },
+        change(next) {
+            Object.assign(state, next); state.revision++;
+            if ('activeId' in next || 'gain' in next) state.stateRevision++;
+            for (const fn of listeners) fn({ ...state });
+        },
         startInput() { inputRunning = true; this.change({ routeKey: `interface:${selected}`, routeLabel: 'Interface' }); },
         async refreshWizard() { for (const timer of intervals) if (!timer.cleared && timer.ms === 200) timer.fn(); await flush(); },
         async tickSampler(ms) { now += ms; for (const timer of [...intervals]) if (!timer.cleared && timer.ms === 120) timer.fn(); await flush(); },
@@ -116,6 +132,20 @@ function setup({ profiles = true, browser = false, pendingReady = false, initial
             overlay.querySelector('.nd-cal-next').onclick();
             peak = 0.1;
             await this.body.querySelector('.nd-cal-start-signal').onclick(); await flush();
+        },
+        async draft(type = 'bass', name = 'My bass') {
+            const context = await service.captureDraftContext(type);
+            const pending = det.measureInstrumentGain({type, name, context});
+            await flush();
+            return {pending, context};
+        },
+        async captureDraft() {
+            const draft = await this.draft();
+            await this.body.querySelector('.nd-cal-start-noise').onclick(); await flush();
+            overlay.querySelector('.nd-cal-next').onclick();
+            peak = 0.1;
+            await this.body.querySelector('.nd-cal-start-signal').onclick(); await flush();
+            return draft;
         },
         settings() {
             const bar = element(), controls = [];
@@ -368,3 +398,156 @@ test('legacy settings slider saves to the active profile and rejects a profile s
     assert.deepEqual(s.nativeWrites, []);
     s.det.destroy();
 });
+
+test('draft bass calibration returns a proposal only after Use calibration, without saving or changing gain', async () => {
+    const s = setup();
+    const {pending} = await s.captureDraft();
+    let settled = false; pending.then(() => { settled = true; });
+    await flush();
+    assert.equal(settled, false);
+    assert.match(s.overlay.querySelector('.nd-cal-title').textContent, /My bass/);
+    assert.match(s.body.innerHTML, /bass notes or plucks/);
+    assert.match(s.body.innerHTML, /Use calibration/);
+    assert.equal(s.overlay.querySelector('.nd-cal-next').style.display, 'none');
+    await s.body.querySelector('.nd-cal-save-gain').onclick();
+    const result = await pending;
+    assert.equal(result.gain, 2.5);
+    assert.equal(result.context.type, 'bass');
+    assert.equal(result.context.routeKey, 'interface:0');
+    assert.equal(result.metadata.rawPeak, 0.1);
+    assert.equal(result.metadata.method, 'guided-level-v1');
+    assert.equal(s.state.activeId, 'default');
+    assert.equal(s.state.gain, 1.7);
+    assert.deepEqual(s.writes, []);
+    assert.deepEqual(s.nativeWrites, []);
+    assert.equal(s.overlay.isConnected, false);
+    s.det.destroy();
+});
+
+for (const afterCapture of [false, true]) {
+    test(`cancelling draft calibration ${afterCapture ? 'after capture' : 'before capture'} resolves null without persistence`, async () => {
+        const s = setup();
+        const {pending} = await (afterCapture ? s.captureDraft() : s.draft());
+        s.det.closeCalibrationWizard();
+        assert.equal(await pending, null);
+        assert.equal(s.state.gain, 1.7);
+        assert.deepEqual(s.writes, []);
+        assert.deepEqual(s.nativeWrites, []);
+        s.det.destroy();
+    });
+}
+
+for (const mutation of [{activeId: 'other'}, {routeKey: 'interface:1'}, {sessionLocked: true}]) {
+    test(`draft calibration cannot finish after ${Object.keys(mutation)[0]} changes`, async () => {
+        const s = setup();
+        const {pending} = await s.captureDraft();
+        s.change(mutation);
+        await s.body.querySelector('.nd-cal-save-gain').onclick();
+        assert.match(s.body.innerHTML, /changed.*Start again/);
+        assert.deepEqual(s.writes, []);
+        s.det.closeCalibrationWizard();
+        assert.equal(await pending, null);
+        s.det.destroy();
+    });
+}
+
+test('closing a draft while final validation is pending prevents a late measurement result', async () => {
+    const s = setup();
+    const {pending} = await s.captureDraft();
+    let resume;
+    s.service.refresh = () => new Promise(resolve => { resume = resolve; });
+    const finishing = s.body.querySelector('.nd-cal-save-gain').onclick();
+    await flush();
+    s.det.closeCalibrationWizard();
+    assert.equal(await pending, null);
+    resume(s.state);
+    await finishing;
+    assert.deepEqual(s.writes, []);
+    assert.deepEqual(s.nativeWrites, []);
+    s.det.destroy();
+});
+
+test('draft calibration can bind an input started and selected before its first measurement', async () => {
+    const s = setup({initialRunning: false});
+    s.service.refresh = async () => ({...s.state, applied: !!s.state.routeKey});
+    const {pending} = await s.draft();
+    assert.match(s.overlay.querySelector('.nd-cal-title').textContent, /Audio Input/);
+    s.startInput();
+    await s.refreshWizard();
+    await s.body.querySelector('.nd-cal-enable-detect').onclick();
+    const channel = s.body.querySelector('.nd-cal-native-channel');
+    channel.value = '0'; channel.onchange();
+    await s.body.querySelector('.nd-cal-use-channel').onclick();
+    s.overlay.querySelector('.nd-cal-next').onclick();
+    await s.body.querySelector('.nd-cal-start-noise').onclick(); await flush();
+    s.overlay.querySelector('.nd-cal-next').onclick();
+    s.setPeak(0.1);
+    await s.body.querySelector('.nd-cal-start-signal').onclick(); await flush();
+    await s.body.querySelector('.nd-cal-save-gain').onclick();
+    const result = await pending;
+    assert.equal(result.gain, 2.5);
+    assert.equal(result.context.routeKey, 'interface:0');
+    assert.deepEqual(s.writes, []);
+    s.det.destroy();
+});
+
+test('browser draft returns calibrated gain while preserving the live active-profile gain', async () => {
+    const s = setup({browser: true});
+    const {pending} = await s.draft('guitar', 'Tele');
+    await s.body.querySelector('.nd-cal-start-noise').onclick(); await flush();
+    await s.tickSampler(2000);
+    s.overlay.querySelector('.nd-cal-next').onclick();
+    s.setPeak(0.1);
+    await s.body.querySelector('.nd-cal-start-signal').onclick(); await flush();
+    await s.tickSampler(3400);
+    await s.body.querySelector('.nd-cal-save-gain').onclick();
+    assert.equal((await pending).gain, 2.5);
+    assert.equal(s.gainNodes.at(-1).gain.value, 1.7);
+    assert.deepEqual(s.writes, []);
+    s.det.destroy();
+});
+
+test('draft calibration rejects a changed instrument type before opening', async () => {
+    const s = setup();
+    const context = await s.service.captureDraftContext('guitar');
+    await assert.rejects(s.det.measureInstrumentGain({type: 'bass', name: 'Bass', context}), /instrument type changed/);
+    assert.equal(s.overlay, undefined);
+    assert.deepEqual(s.writes, []);
+    s.det.destroy();
+});
+
+test('selected Bass level calibration keeps its name and playing instructions after a guitar song', async () => {
+    const s = setup();
+    s.change({activeId: 'jazz-bass', activeName: 'Jazz Bass', activeType: 'bass'});
+    s.sb.highway.getSongInfo = () => ({arrangement: 'guitar-lead', tuning: [0, 0, 0, 0, 0, 0]});
+    s.sb.feedBack.instrumentSession = {isLocked: () => false};
+    await s.det.launchGuitarCalibration(); await flush();
+    assert.match(s.body.innerHTML, /Jazz Bass.*Bass/);
+    await s.body.querySelector('.nd-cal-start-noise').onclick(); await flush();
+    s.overlay.querySelector('.nd-cal-next').onclick();
+    assert.match(s.body.innerHTML, /strongest normal bass notes or plucks/);
+    s.det.destroy();
+});
+
+for (const inSong of [false, true]) {
+    test(`full Bass setup ${inSong ? 'preserves a loaded song tuning' : 'uses selected five-string Bass after leaving a guitar song'}`, async () => {
+        const s = setup();
+        s.change({activeId: 'jazz-bass', activeName: 'Jazz Bass', activeType: 'bass'});
+        s.sb.highway.getSongInfo = () => ({arrangement: 'guitar-lead', tuning: [-2, 0, 0, 0, 0, 0]});
+        s.sb.highway.getStringCount = () => 6;
+        s.sb.feedBack.instrumentSession = {isLocked: () => inSong};
+        s.sb.feedBack.workingTuning = {get: () => ({instrument: 'bass', stringCount: 5})};
+        await s.open(false);
+        for (let i = 0; i < 5; i++) { s.overlay.querySelector('.nd-cal-next').onclick(); await flush(); }
+        if (inSong) {
+            assert.match(s.body.innerHTML, /Open low string \(D2\)/);
+            assert.doesNotMatch(s.body.innerHTML, /Auto \(5-string bass\)/);
+        } else {
+            assert.match(s.body.innerHTML, /Auto \(5-string bass\)/);
+            assert.match(s.body.innerHTML, /Open low string \(B0\)/);
+            assert.equal(s.det._getChartState().arrangement, 'bass');
+            assert.equal(s.det._getChartState().stringCount, 5);
+        }
+        s.det.destroy();
+    });
+}
