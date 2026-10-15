@@ -15,6 +15,7 @@ function setup({ profiles = true, browser = false, pendingReady = false, initial
     const service = {
         ready: pendingReady ? new Promise(resolve => { resolveReady = resolve; }) : Promise.resolve(), getSnapshot: () => ({ ...state }),
         subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
+        async refresh() { return { ...state }; },
         async captureContext() {
             if (!state.routeKey) throw Error('Start and select your audio input before calibrating.');
             return { profileId: state.activeId, activeName: state.activeName, routeKey: state.routeKey, routeLabel: state.routeLabel, revision: state.revision };
@@ -91,7 +92,7 @@ function setup({ profiles = true, browser = false, pendingReady = false, initial
     } });
     const det = sb.noteDetect || core.createNoteDetector({ isDefault: true });
     return {
-        sb, det, service, state, writes, nativeWrites, gainNodes, listeners, resolveReady: () => resolveReady(),
+        sb, det, service, state, writes, nativeWrites, gainNodes, listeners, intervals, resolveReady: () => resolveReady(),
         change(next) { Object.assign(state, next); state.revision++; for (const fn of listeners) fn({ ...state }); },
         startInput() { inputRunning = true; this.change({ routeKey: `interface:${selected}`, routeLabel: 'Interface' }); },
         async refreshWizard() { for (const timer of intervals) if (timer.ms === 200) timer.fn(); await flush(); },
@@ -138,6 +139,43 @@ test('Default guitar gain is awaited, applied to browser node live, and not appl
     assert.equal(native.det.getDiagnostic().settings.input_gain, 1.7);
     assert.deepEqual(native.nativeWrites, []);
     native.det.destroy();
+});
+
+test('native input startup waits for the newly opened route gain before starting detection', async () => {
+    const s = setup({ initialRunning: false });
+    let started = false, refreshed = false, resolved = false, resume;
+    const gainApplied = new Promise(resolve => { resume = resolve; });
+    s.sb.feedBackDesktop.audio.startAudio = async () => {
+        started = true;
+        s.startInput();
+    };
+    s.service.refresh = async () => {
+        assert.equal(started, true, 'refresh must read the actual opened input');
+        refreshed = true;
+        await gainApplied;
+        s.change({ gain: 2.8, applied: true });
+        return s.service.getSnapshot();
+    };
+    const enabling = s.det.enable().then(result => { resolved = true; return result; });
+    await flush();
+    assert.equal(refreshed, true);
+    assert.equal(resolved, false, 'enable must wait until native calibration has applied');
+    assert.equal(s.intervals.some(timer => timer.ms === 50), false, 'no frames may be polled with stale gain');
+    resume();
+    assert.equal(await enabling, true);
+    assert.equal(s.det.getDiagnostic().settings.input_gain, 2.8);
+    assert.equal(s.intervals.some(timer => timer.ms === 50), true);
+    assert.deepEqual(s.nativeWrites, []);
+    s.det.destroy();
+});
+
+test('native detection does not start when the selected route calibration cannot apply', async () => {
+    const s = setup();
+    s.service.refresh = async () => { throw Error('Input device changed while applying gain'); };
+    assert.equal(await s.det.enable(), false);
+    assert.equal(s.intervals.some(timer => timer.ms === 50), false);
+    assert.deepEqual(s.nativeWrites, []);
+    s.det.destroy();
 });
 
 test('full setup can choose an input before capture and applies its gain through the same profile service', async () => {

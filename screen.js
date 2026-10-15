@@ -4527,6 +4527,18 @@ function createNoteDetector(options = {}) {
                         }
                     } catch (_) { /* engine surfaces its own errors */ }
 
+                    // The device may only have become available in open-source /
+                    // startAudio above. Resolve and apply its guitar level before
+                    // any detector reads frames from this newly opened route.
+                    const profiles = _ndGuitarProfiles();
+                    if (profiles) {
+                        const snapshot = await profiles.refresh();
+                        if (snapshot?.applied === false) {
+                            throw new Error(snapshot.error || 'Start and select your audio input before detecting notes.');
+                        }
+                        _ndReceiveGuitarProfile(snapshot);
+                    }
+
                     usingDesktopBridge = true;
                     bridgeDesktop = desktop;
                     accumBuffer = new Float32Array(0);
