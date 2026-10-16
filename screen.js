@@ -2985,8 +2985,8 @@ function createNoteDetector(options = {}) {
     // Set only around the construct-time auto-enable's first (silent,
     // automatic) attempt — the one with a delayed retry still in hand. In that
     // window the open should be non-committal: startAudio() suppresses its
-    // user-facing failure alert (a transient not-ready device shouldn't pop a
-    // dialog on load) AND openInstrumentStream() preserves a saved deviceId
+    // user-facing failure status (a transient not-ready device shouldn't flash
+    // a notice on load) AND openInstrumentStream() preserves a saved deviceId
     // that fails to match (it may just be mid-enumeration) instead of forgetting
     // it. The retry and every user-initiated enable run with this false, so
     // genuine failures surface and a genuinely stale device is forgotten.
@@ -4351,6 +4351,62 @@ function createNoteDetector(options = {}) {
     try { instanceRoot.setAttribute('data-nd-skin', _ndLoadSkin()); } catch (e) {}
     let detectBtn = null;
     let gearBtn = null;
+    let inputStatus = null;
+
+    function _syncInputStatusVisibility() {
+        if (!inputStatus) return;
+        const hidden = _scoringStalled || (isDefault && !!window.__ndSuppressDefault);
+        if (inputStatus.hidden !== hidden) inputStatus.hidden = hidden;
+    }
+
+    function _clearInputStatus() {
+        if (inputStatus) inputStatus.remove();
+        inputStatus = null;
+    }
+
+    function _showInputStatus(error) {
+        if (guitarProfilesDestroyed || (isDefault && window.__ndSuppressDefault)) return;
+        if (!inputStatus) {
+            const notice = document.createElement('div');
+            notice.className = 'nd-input-status';
+            notice.setAttribute('role', 'status');
+            notice.setAttribute('aria-live', 'polite');
+            notice.style.cssText = `position:${isDefault ? 'fixed' : 'absolute'};right:1rem;bottom:6rem;z-index:300;max-width:min(28rem,calc(100% - 2rem));box-sizing:border-box;padding:10px 12px;border:1px solid #8d713d;border-radius:8px;background:#29251c;color:#f4e4bd;font-size:13px;pointer-events:auto;`;
+            const message = document.createElement('span');
+            message.textContent = 'Audio input unavailable — note detection paused.';
+            notice.appendChild(message);
+            const settings = document.createElement('button');
+            settings.className = 'nd-input-status-settings';
+            settings.type = 'button';
+            settings.textContent = 'Audio settings';
+            settings.style.cssText = 'display:block;margin-top:6px;padding:0;border:0;background:transparent;font:inherit;text-decoration:underline;color:inherit;cursor:pointer;';
+            settings.onclick = () => {
+                if (typeof window.showScreen === 'function' && document.getElementById('plugin-audio_engine')) {
+                    window.showScreen('plugin-audio_engine');
+                } else {
+                    showSettings();
+                }
+            };
+            notice.appendChild(settings);
+            const details = document.createElement('details');
+            details.style.cssText = 'margin-top:4px;font-size:12px;overflow-wrap:anywhere;';
+            const summary = document.createElement('summary');
+            summary.textContent = 'Details';
+            details.appendChild(summary);
+            const detail = document.createElement('span');
+            detail.className = 'nd-input-status-detail';
+            details.appendChild(detail);
+            notice.appendChild(details);
+            // The default detector's player subtree is hidden on Home. Keep
+            // this status visible there without moving any gameplay HUD.
+            (isDefault ? document.body : instanceRoot).appendChild(notice);
+            inputStatus = notice;
+        }
+        const detail = inputStatus.querySelector('.nd-input-status-detail');
+        const message = error && error.message ? String(error.message) : 'Select and start your audio input in Audio settings.';
+        if (detail && detail.textContent !== message) detail.textContent = message;
+        _syncInputStatusVisibility();
+    }
 
     // Draw hook — registered once per instance; removed in destroy().
     // The hook itself early-returns when !enabled, so the cost is
@@ -4489,6 +4545,7 @@ function createNoteDetector(options = {}) {
 
     // ── Audio pipeline ────────────────────────────────────────────────
     async function startAudio() {
+        const startGeneration = sessionGen;
         try {
             // Desktop (Electron) bridge path. When the slopsmith-desktop
             // shell is hosting us, the native JUCE engine already owns
@@ -5057,7 +5114,7 @@ function createNoteDetector(options = {}) {
             return true;
         } catch (e) {
             console.error('Note detect: mic access denied or failed:', e);
-            // Suppress the user-facing alert if the instance is no
+            // Suppress the user-facing status if the instance is no
             // longer enabled — the enable/restart was superseded by a
             // concurrent disable (e.g. song switch while the mic
             // permission prompt was open). Surfacing an error the
@@ -5065,9 +5122,10 @@ function createNoteDetector(options = {}) {
             // The console.error still goes to devtools for
             // diagnostics. autoEnableTrial silences the automatic
             // first auto-enable attempt (a transient not-ready USB device
-            // shouldn't pop a dialog on load — the retry surfaces it).
-            if (enabled && !autoEnableTrial) {
-                alert('Note Detection: Could not access audio input.\n\n' + e.message);
+            // shouldn't flash a notice — the retry surfaces it). Never block
+            // browsing or playback with a modal during automatic recovery.
+            if (enabled && startGeneration === sessionGen && !autoEnableTrial) {
+                _showInputStatus(e);
             }
             // Partial-init cleanup — if we got as far as acquiring the
             // stream or creating any AudioNodes before the throw, we
@@ -5152,6 +5210,7 @@ function createNoteDetector(options = {}) {
 
     function _scoringWatchdogTick() {
         const now = (typeof Date !== 'undefined' && Date.now) ? Date.now() : 0;
+        _syncInputStatusVisibility();
         // In split mode the default singleton is suppressed — a panel owns
         // capture. Without this guard the watchdog would call enable() on the
         // suppressed default and bring the main HUD/mic back on top of P1.
@@ -5223,11 +5282,13 @@ function createNoteDetector(options = {}) {
             if (retry) retry.onclick = () => { try { restartAudio(); } catch (_) {} };
         }
         banner.style.display = '';
+        _syncInputStatusVisibility();
     }
 
     function _hideScoringStallBanner() {
         const banner = instanceRoot.querySelector('.nd-scoring-stall');
         if (banner) banner.remove();
+        _syncInputStatusVisibility();
     }
 
     // Dropout telemetry — captures the discriminating state at the moment
@@ -5389,7 +5450,7 @@ function createNoteDetector(options = {}) {
             // already owns the teardown.
             if (!ok) {
                 if (gen === sessionGen && enabled) {
-                    disable({ silent: true });
+                    disable({ silent: true, preserveInputStatus: true });
                 }
                 return;
             }
@@ -5399,6 +5460,8 @@ function createNoteDetector(options = {}) {
             // acquired in that case.
             if (gen !== sessionGen || !enabled) {
                 stopAudio();
+            } else {
+                _clearInputStatus();
             }
         });
     }
@@ -16066,6 +16129,7 @@ function createNoteDetector(options = {}) {
 
         // External detection source (MIDI keys highway): score from the
         // note-detection domain instead of the mic — same graded HUD + summary.
+        if (_ndIsExternalScoredArrangement()) _clearInputStatus();
         if (_ndIsExternalScoredArrangement() && _extScan()) return _enableExternal();
         // Keys/piano arrangement with no provider yet: never start the mic —
         // idle until an external provider's binding registers (the bind watcher
@@ -16115,6 +16179,8 @@ function createNoteDetector(options = {}) {
             updateButton();
             return false;
         }
+
+        _clearInputStatus();
 
         missCheckInterval = setInterval(checkMisses, 100);
         startHUD();
@@ -16182,6 +16248,7 @@ function createNoteDetector(options = {}) {
     // lexical shadow.
     function disable(disableOptions) {
         _ndChartSignatureCache = null;
+        if (!disableOptions?.preserveInputStatus) _clearInputStatus();
         if (!enabled) return;
         enabled = false;
         // A conductor drill is pointless without detection running — end it so
@@ -19633,10 +19700,10 @@ function createNoteDetector(options = {}) {
         // device class. USB interfaces (e.g. the Real Tone Cable) can be
         // enumerated-but-not-yet-openable at first paint, which fails the
         // stream open; in that case retry once after a short settle. The
-        // first (silent, automatic) attempt suppresses the failure alert so
-        // a transient not-ready device doesn't pop a dialog on load; the
+        // first (silent, automatic) attempt suppresses the failure status so
+        // a transient not-ready device doesn't flash a notice on load; the
         // retry runs un-suppressed so a genuinely unusable device is still
-        // surfaced.
+        // shown as a nonblocking status.
         const autoEnableAttempt = (retriesLeft) => {
             // Re-check BOTH enabled and detectPreference each attempt. A fast
             // user click could have already enabled us (`enabled`), and
@@ -19646,7 +19713,7 @@ function createNoteDetector(options = {}) {
             if (typeof window !== 'undefined' && window.__ndSuppressDefault) return;
             if (enabled || !detectPreference) return;
             // Only the first attempt (one with a retry still in hand) is a
-            // silent, non-committal trial — quiet alerts and a preserved device.
+            // silent, non-committal trial — no notice and a preserved device.
             autoEnableTrial = retriesLeft > 0;
             enable().then((ok) => {
                 autoEnableTrial = false;

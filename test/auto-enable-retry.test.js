@@ -5,15 +5,14 @@
 // (e.g. the Real Tone Cable) can be enumerated-but-not-yet-openable at
 // first paint; when the first open fails, the detector retries once after
 // a short settle. The first (silent, automatic) attempt suppresses the
-// user-facing failure alert so a transient not-ready device doesn't pop a
-// dialog on load — the retry runs un-suppressed so a genuinely unusable
-// device is still surfaced.
+// user-facing failure status so a transient not-ready device doesn't flash a
+// notice on load — the retry shows a nonblocking status if it still fails.
 //
 // These tests make the *load-time default singleton* the subject: providing
 // window.AudioContext flips its `_hasAudio` gate on, so it auto-enables
 // during load. AudioContext returns a bare object missing the node-factory
 // methods, so startAudio fails just AFTER getUserMedia — enough to exercise
-// the failure → retry → alert path without a full Web Audio mock. In its own
+// the failure → retry path without a full Web Audio mock. In its own
 // file because enabling the audio path globally would perturb the
 // _hasAudio-off assumption the rest of the suite relies on.
 
@@ -78,12 +77,12 @@ function loadWithAudio({ gumResults, savedDeviceId }) {
 test('auto-enable: first attempt fails (device not ready) → retries once, no alert on the silent first attempt', async () => {
     // First open rejects (not ready); second open resolves the stream but
     // startAudio still fails on the bare AudioContext — the point is the
-    // SECOND getUserMedia happened and the alert was gated correctly.
+    // SECOND getUserMedia happened without blocking the user with an alert.
     const { counts } = loadWithAudio({ gumResults: [notReadable(), { getTracks: () => [] }] });
     await flushPendingAsync();
 
     assert.equal(counts.gum, 2, 'auto-enable retries exactly once after the first failure');
-    assert.equal(counts.alert, 1, 'no alert on the silent first attempt; the retry surfaces the failure');
+    assert.equal(counts.alert, 0, 'neither automatic attempt opens a modal');
 });
 
 test('auto-enable: a first attempt that fails then a clean stream does not over-retry', async () => {
@@ -93,7 +92,7 @@ test('auto-enable: a first attempt that fails then a clean stream does not over-
     await flushPendingAsync();
 
     assert.equal(counts.gum, 2, 'exactly one retry — auto-enable never loops past two attempts');
-    assert.equal(counts.alert, 1, 'alert is suppressed on the first attempt and shown once on the retry');
+    assert.equal(counts.alert, 0, 'persistent failure stays nonblocking');
 });
 
 test('auto-enable: a saved device that fails to match on the silent first attempt is PRESERVED and re-tried, not forgotten', async () => {
