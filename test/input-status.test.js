@@ -77,13 +77,23 @@ function setup({ browser = false, detectWanted = false, autoEnable = false } = {
     const document = makeDocument(), intervals = new Map(), timeouts = new Map();
     let sb, id = 0, now = 10000, refreshGate = null, mediaGate = null;
     const state = { loaded: true, gain: 1, applied: false, activeId: 'default', revision: 1,
+        routeKey: 'microphone', route: { generation: 1 },
         error: 'Start and select your audio input before detecting notes.' };
     const calls = { alerts: [], media: 0, refresh: 0, settings: [], errors: [] };
-    const listeners = new Set();
+    const listeners = new Set(), events = new Map();
+    const emitProfile = patch => {
+        Object.assign(state, patch);
+        for (const listener of listeners) listener({ ...state });
+    };
     const profiles = {
         ready: Promise.resolve(), getSnapshot: () => ({ ...state }),
         subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
-        async refresh() { calls.refresh++; return refreshGate ? refreshGate : { ...state }; },
+        async refresh() {
+            calls.refresh++;
+            const result = await (refreshGate || { ...state });
+            emitProfile({});
+            return result;
+        },
     };
     const core = loadDetectionCore({ sandboxBeforeRun(s) {
         sb = s; s.document = document;
@@ -94,7 +104,15 @@ function setup({ browser = false, detectWanted = false, autoEnable = false } = {
         s.clearTimeout = timer => timeouts.delete(timer);
         s.setInterval = (fn, ms) => { intervals.set(++id, { fn, ms }); return id; };
         s.clearInterval = timer => intervals.delete(timer);
-        s.dispatchEvent = () => true;
+        s.addEventListener = (name, fn) => {
+            if (!events.has(name)) events.set(name, new Set());
+            events.get(name).add(fn);
+        };
+        s.removeEventListener = (name, fn) => events.get(name)?.delete(fn);
+        s.dispatchEvent = event => {
+            for (const listener of events.get(event.type) || []) listener(event);
+            return true;
+        };
         s.localStorage.getItem = key => key === 'slopsmith_notedetect' ? JSON.stringify({ detectEnabled: detectWanted }) : null;
         // The function's presence enables the real construct-time startup
         // gate. Media rejection happens before a context would be created.
@@ -115,11 +133,19 @@ function setup({ browser = false, detectWanted = false, autoEnable = false } = {
     } });
     assert.ok(sb.noteDetect, 'real plugin singleton must bootstrap successfully');
     return {
-        sb, core, document, state, calls, profiles, intervals, timeouts,
+        sb, core, document, state, calls, profiles, intervals, timeouts, events, emitProfile,
         det: sb.noteDetect,
         notice: () => document.querySelector('.nd-input-status'),
         gateRefresh(promise) { refreshGate = promise; },
         gateMedia(promise) { mediaGate = promise; },
+        routeChanged() { sb.dispatchEvent(new sb.CustomEvent('feedback:audio-route-changed')); },
+        async runRecovery() {
+            await flush();
+            for (const [timerId, timer] of [...timeouts]) if (timer.ms === 0) {
+                timeouts.delete(timerId); timer.fn();
+            }
+            await flush();
+        },
         tickWatchdog(ms = 0) {
             now += ms;
             for (const timer of [...intervals.values()]) if (timer.ms === 1000) timer.fn();
@@ -350,4 +376,211 @@ test('split-screen suppression hides a default notice and does not create a seco
     s.core.createNoteDetector.setDefaultSuppressed(false);
     s.tickWatchdog();
     assert.equal(notice.hidden, false);
+});
+
+test('ready input restores wanted detection while idle, after Apply synchronizes its source', async t => {
+    const s = setup({ detectWanted: true }); t.after(() => s.destroy());
+    await s.det.enable();
+    const notice = s.notice(), before = s.calls.refresh;
+    let selected = 'old-asio', opened = [];
+    s.sb.slopsmith.capabilities = { async command(domain, command) {
+        if (command === 'open-source') opened.push(selected);
+        return { outcome: 'handled' };
+    } };
+    // Match Audio Apply: refresh publishes readiness before it updates the
+    // input capability selection, then dispatches the route event.
+    s.emitProfile({ applied: true, error: '' });
+    await flush();
+    assert.equal(s.det.isEnabled(), false, 'profile publication must not reopen the old source');
+    assert.deepEqual(opened, []);
+    selected = 'microphone';
+    s.routeChanged();
+    await s.runRecovery();
+    assert.equal(s.det.isEnabled(), true);
+    assert.equal(s.calls.refresh, before + 1, 'profile and route events coalesce');
+    assert.deepEqual(opened, ['microphone']);
+    assert.equal(s.notice(), null);
+    assert.equal(notice.isConnected, false);
+    assert.equal(s.sb.slopsmith.isPlaying, undefined, 'no playback was needed');
+});
+
+test('route event during a failing start retries after that start settles', async t => {
+    const s = setup({ detectWanted: true }); t.after(() => s.destroy());
+    let release;
+    s.gateRefresh(new Promise(resolve => { release = resolve; }));
+    const enabling = s.det.enable();
+    await flush();
+    s.emitProfile({ applied: true, error: '' });
+    s.routeChanged();
+    await s.runRecovery();
+    assert.equal(s.calls.refresh, 1, 'recovery must wait for the earlier startup');
+    s.gateRefresh(null);
+    release({ ...s.state, applied: false, error: 'Old device failed' });
+    assert.equal(await enabling, false);
+    await flush();
+    assert.equal(s.calls.refresh, 2);
+    assert.equal(s.det.isEnabled(), true);
+    assert.equal(s.notice(), null);
+});
+
+test('healthy detection ignores repeated readiness and route events without resetting its session', async t => {
+    const s = setup({ detectWanted: true }); t.after(() => s.destroy());
+    s.state.applied = true;
+    await s.det.enable();
+    const before = s.calls.refresh, timers = [...s.intervals.keys()];
+    s.emitProfile({ revision: 2, gain: 2 });
+    s.emitProfile({ route: { generation: 2 } });
+    s.routeChanged(); s.routeChanged();
+    await s.runRecovery();
+    assert.equal(s.calls.refresh, before);
+    assert.deepEqual([...s.intervals.keys()], timers, 'the active detection/HUD session remains intact');
+    assert.equal(s.det.isEnabled(), true);
+});
+
+test('failed recovery is bounded until fresh readiness or an explicit route change', async t => {
+    const s = setup({ detectWanted: true }); t.after(() => s.destroy());
+    await s.det.enable();
+    s.emitProfile({ applied: true });
+    s.gateRefresh(Promise.resolve({ ...s.state, applied: false, error: 'Still unavailable' }));
+    await s.runRecovery();
+    const attempts = s.calls.refresh;
+    assert.equal(attempts, 2);
+    assert.equal(s.det.isEnabled(), false);
+    // Real profile polling republishes unchanged readiness; calibration edits
+    // can change the general revision without changing the input route.
+    for (let i = 0; i < 3; i++) {
+        s.emitProfile({ revision: 3 + i, gain: 1 + i });
+        await s.runRecovery();
+    }
+    assert.equal(s.calls.refresh, attempts);
+    s.gateRefresh(null);
+    s.routeChanged();
+    await s.runRecovery();
+    assert.equal(s.calls.refresh, attempts + 1);
+    assert.equal(s.det.isEnabled(), true);
+});
+
+test('a recovery refresh cannot create its own retry loop', async t => {
+    const s = setup({ detectWanted: true }); t.after(() => s.destroy());
+    await s.det.enable();
+    s.emitProfile({ applied: true });
+    s.profiles.refresh = async () => {
+        s.calls.refresh++;
+        s.emitProfile({ applied: false });
+        s.emitProfile({ applied: true });
+        return { ...s.state, applied: false, error: 'Opening still fails' };
+    };
+    await s.runRecovery();
+    await s.runRecovery();
+    assert.equal(s.calls.refresh, 2);
+    assert.equal(s.det.isEnabled(), false);
+    assert.ok(s.notice());
+});
+
+test('new native route generation permits recovery even on the same named input', async t => {
+    const s = setup({ detectWanted: true }); t.after(() => s.destroy());
+    await s.det.enable();
+    s.emitProfile({ applied: true });
+    s.gateRefresh(Promise.resolve({ ...s.state, applied: false }));
+    await s.runRecovery();
+    s.gateRefresh(null);
+    s.emitProfile({ route: { generation: 2 } });
+    await s.runRecovery();
+    assert.equal(s.calls.refresh, 3);
+    assert.equal(s.det.isEnabled(), true);
+});
+
+test('new readiness during a failed recovery is retained without a route event', async t => {
+    const s = setup({ detectWanted: true }); t.after(() => s.destroy());
+    await s.det.enable();
+    let release;
+    s.gateRefresh(new Promise(resolve => { release = resolve; }));
+    s.emitProfile({ applied: true });
+    await s.runRecovery();
+    assert.equal(s.calls.refresh, 2);
+    s.emitProfile({ route: { generation: 2 } });
+    s.gateRefresh(null);
+    release({ ...s.state, applied: false });
+    await s.runRecovery();
+    assert.equal(s.calls.refresh, 3);
+    assert.equal(s.det.isEnabled(), true);
+    assert.equal(s.notice(), null);
+});
+
+test('disable cancels queued recovery even when detection is already off', async t => {
+    const s = setup({ detectWanted: true }); t.after(() => s.destroy());
+    await s.det.enable();
+    s.emitProfile({ applied: true });
+    s.det.disable({ silent: true });
+    s.routeChanged();
+    await s.runRecovery();
+    assert.equal(s.calls.refresh, 1);
+    assert.equal(s.det.isEnabled(), false);
+    assert.equal(s.notice(), null);
+});
+
+test('disable during recovery preflight cannot resurrect the detector', async t => {
+    const s = setup({ detectWanted: true }); t.after(() => s.destroy());
+    await s.det.enable();
+    let release;
+    s.profiles.ready = new Promise(resolve => { release = resolve; });
+    s.emitProfile({ applied: true });
+    s.state.loaded = false;
+    await s.runRecovery();
+    s.det.disable({ silent: true });
+    s.state.loaded = true;
+    release();
+    await flush();
+    assert.equal(s.det.isEnabled(), false);
+    assert.equal(s.calls.refresh, 1, 'cancelled preflight never opens input');
+    assert.equal(s.notice(), null);
+});
+
+test('split suppression during recovery preflight cannot enable the default detector', async t => {
+    const s = setup({ detectWanted: true }); t.after(() => s.destroy());
+    await s.det.enable();
+    let release;
+    s.profiles.ready = new Promise(resolve => { release = resolve; });
+    s.emitProfile({ applied: true });
+    s.state.loaded = false;
+    await s.runRecovery();
+    s.core.createNoteDetector.setDefaultSuppressed(true);
+    s.state.loaded = true;
+    release();
+    await flush();
+    assert.equal(s.det.isEnabled(), false);
+    assert.equal(s.calls.refresh, 1);
+});
+
+test('recovery respects user-off, split suppression, external MIDI and destruction', async t => {
+    for (const blockedBy of ['user-off', 'split', 'external', 'destroy']) {
+        const s = setup({ detectWanted: blockedBy !== 'user-off' });
+        t.after(() => s.destroy());
+        await s.det.enable();
+        s.emitProfile({ applied: true });
+        if (blockedBy === 'split') s.sb.__ndSuppressDefault = true;
+        if (blockedBy === 'external') s.sb.highway.getSongInfo = () => ({ arrangement: 'keys' });
+        if (blockedBy === 'destroy') s.det.destroy();
+        s.routeChanged();
+        await s.runRecovery();
+        assert.equal(s.calls.refresh, 1, blockedBy);
+        assert.equal(s.det.isEnabled(), false, blockedBy);
+        if (blockedBy === 'destroy') {
+            assert.equal(s.events.get('feedback:audio-route-changed').size, 0);
+            assert.equal(s.notice(), null);
+        }
+    }
+});
+
+test('route notifications never acquire browser or secondary inputs', async t => {
+    const s = setup({ browser: true, detectWanted: true }); t.after(() => s.destroy());
+    const secondary = s.core.createNoteDetector({ isDefault: false });
+    t.after(() => secondary.destroy());
+    await s.det.enable(); await secondary.enable();
+    s.emitProfile({ applied: true });
+    s.routeChanged();
+    await s.runRecovery();
+    assert.equal(s.calls.media, 2);
+    assert.equal(s.events.get('feedback:audio-route-changed').size, 1, 'only the default detector subscribes');
+    assert.equal(secondary.isEnabled(), false);
 });

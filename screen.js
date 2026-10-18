@@ -3095,12 +3095,75 @@ function createNoteDetector(options = {}) {
     let guitarProfilesUnsubscribe = null;
     let guitarProfilesBound = null;
     let guitarProfilesDestroyed = false;
+    let inputStartFailed = false;
+    let inputReadyRoute = null;
+    let inputRecoveryEpoch = 0;
+    let inputRecoveryPending = false;
+    let inputRecoveryScheduled = false;
+    let inputRecoveryStarting = false;
+    let inputRecoveryRoute = null;
+    let inputRecoveryTimer = null;
+    function _ndCanRecoverInput() {
+        return isDefault && detectPreference && !guitarProfilesDestroyed
+            && !window.__ndSuppressDefault && !_ndIsExternalScoredArrangement()
+            && !externalStream && !externalAudioCtx
+            && window.feedBackDesktop?.isDesktop && !!window.feedBackDesktop?.audio;
+    }
+    function _ndRequestInputRecovery() {
+        if (!_ndCanRecoverInput()) return;
+        inputRecoveryPending = true;
+        if (inputRecoveryScheduled) return;
+        inputRecoveryScheduled = true;
+        const epoch = inputRecoveryEpoch;
+        // Audio settings publishes its ready profile before synchronizing the
+        // selected source. Let that Apply continuation finish before opening
+        // the source, or recovery could reopen the previous device.
+        inputRecoveryTimer = setTimeout(() => {
+            inputRecoveryTimer = null;
+            void (async () => {
+                // A route change may arrive during the failing startup. Calling
+                // enable immediately would only reuse that doomed promise.
+                if (enableInFlight) {
+                    try { await enableInFlight; } catch (_) { /* inspect the latest route below */ }
+                }
+                await audioOpChain;
+                if (epoch !== inputRecoveryEpoch) return;
+                inputRecoveryPending = false;
+                if (!_ndCanRecoverInput() || enabled || !inputStartFailed
+                    || _ndGuitarProfiles()?.getSnapshot()?.applied !== true) return;
+                inputRecoveryStarting = true;
+                inputRecoveryRoute = inputReadyRoute;
+                try { await enable(); }
+                finally { inputRecoveryStarting = false; inputRecoveryRoute = null; }
+            })().catch(error => console.warn('[note_detect] input recovery failed:', error))
+                .finally(() => {
+                    inputRecoveryScheduled = false;
+                    if (inputRecoveryPending) _ndRequestInputRecovery();
+                });
+        }, 0);
+    }
+    function _ndCancelInputRecovery() {
+        inputRecoveryEpoch++;
+        inputRecoveryPending = false;
+        if (inputRecoveryTimer != null) {
+            clearTimeout(inputRecoveryTimer);
+            inputRecoveryTimer = null;
+            inputRecoveryScheduled = false;
+        }
+    }
     function _ndGuitarProfiles() {
         // Additional players own their own input sources, not the primary guitar.
         return isDefault ? window.feedBack?.guitarProfiles : null;
     }
     function _ndReceiveGuitarProfile(snapshot) {
         if (guitarProfilesDestroyed || snapshot?.loaded === false || !Number.isFinite(snapshot?.gain)) return;
+        const readyRoute = snapshot.applied === true
+            ? JSON.stringify([snapshot.routeKey, snapshot.route?.generation]) : null;
+        const becameReady = readyRoute !== null && readyRoute !== inputReadyRoute;
+        inputReadyRoute = readyRoute;
+        // Ignore unchanged 1.5 s profile polls and gain edits. A recovery's own
+        // refresh must not turn another failed open into an endless retry loop.
+        if (becameReady && (!inputRecoveryStarting || readyRoute !== inputRecoveryRoute)) _ndRequestInputRecovery();
         inputGain = Math.max(0.1, Math.min(5, snapshot.gain));
         engineInputGain = inputGain;
         if (gainNode) gainNode.gain.value = inputGain;
@@ -4360,6 +4423,7 @@ function createNoteDetector(options = {}) {
     }
 
     function _clearInputStatus() {
+        inputStartFailed = false;
         if (inputStatus) inputStatus.remove();
         inputStatus = null;
     }
@@ -5124,8 +5188,9 @@ function createNoteDetector(options = {}) {
             // first auto-enable attempt (a transient not-ready USB device
             // shouldn't flash a notice — the retry surfaces it). Never block
             // browsing or playback with a modal during automatic recovery.
-            if (enabled && startGeneration === sessionGen && !autoEnableTrial) {
-                _showInputStatus(e);
+            if (enabled && startGeneration === sessionGen) {
+                inputStartFailed = true;
+                if (!autoEnableTrial) _showInputStatus(e);
             }
             // Partial-init cleanup — if we got as far as acquiring the
             // stream or creating any AudioNodes before the throw, we
@@ -16076,8 +16141,13 @@ function createNoteDetector(options = {}) {
     }
 
     async function enableImpl() {
+        const recoveryEpoch = inputRecoveryEpoch;
         await _ndSyncGuitarProfile();
         await refreshInputCalibration();
+        // disable/destroy can occur before enabled is set, while either
+        // preflight await is pending. Such a cancelled start must stay off.
+        if (recoveryEpoch !== inputRecoveryEpoch || guitarProfilesDestroyed
+            || (isDefault && window.__ndSuppressDefault)) return false;
         // Resolve the highway lazily — supports plugin load orders
         // where highway isn't defined at factory construction. If
         // it's still missing, there's nothing to hook into, so bail
@@ -16248,7 +16318,10 @@ function createNoteDetector(options = {}) {
     // lexical shadow.
     function disable(disableOptions) {
         _ndChartSignatureCache = null;
-        if (!disableOptions?.preserveInputStatus) _clearInputStatus();
+        if (!disableOptions?.preserveInputStatus) {
+            _ndCancelInputRecovery();
+            _clearInputStatus();
+        }
         if (!enabled) return;
         enabled = false;
         // A conductor drill is pointless without detection running — end it so
@@ -16317,6 +16390,7 @@ function createNoteDetector(options = {}) {
 
     function destroy() {
         guitarProfilesDestroyed = true;
+        if (isDefault) window.removeEventListener?.('feedback:audio-route-changed', _ndRequestInputRecovery);
         guitarProfilesUnsubscribe?.();
         guitarProfilesUnsubscribe = null;
         // Silent disable on teardown: calling plain disable() would
@@ -19656,6 +19730,7 @@ function createNoteDetector(options = {}) {
 
     // Load Core's migrated Default guitar before using the legacy cached gain.
     void _ndSyncGuitarProfile().catch(error => console.warn('[note_detect] Guitar profiles unavailable:', error));
+    if (isDefault) window.addEventListener?.('feedback:audio-route-changed', _ndRequestInputRecovery);
 
     // Register the draw hook once per instance. The hook early-returns
     // on !enabled so disabled instances cost essentially nothing.
