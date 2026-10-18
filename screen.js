@@ -3103,11 +3103,26 @@ function createNoteDetector(options = {}) {
     let inputRecoveryStarting = false;
     let inputRecoveryRoute = null;
     let inputRecoveryTimer = null;
+    let inputRecoveryNeedsProbe = false;
+    function _ndInputAudioInitializing() {
+        // Desktop initializes the primary input; additional players own their
+        // capture lifecycle and do not subscribe to its automatic recovery.
+        return isDefault && window.feedBackAudioStatus?.isInitializing?.() === true;
+    }
     function _ndCanRecoverInput() {
         return isDefault && detectPreference && !guitarProfilesDestroyed
             && !window.__ndSuppressDefault && !_ndIsExternalScoredArrangement()
+            && !_ndInputAudioInitializing()
             && !externalStream && !externalAudioCtx
             && window.feedBackDesktop?.isDesktop && !!window.feedBackDesktop?.audio;
+    }
+    function _ndOnAudioInitialized() {
+        if (!_ndCanRecoverInput()) return;
+        // Startup errors describe an intermediate device state. Probe once
+        // after Desktop settles, including when no input was applied, so only
+        // a fresh failure can create the input status.
+        inputRecoveryNeedsProbe = true;
+        _ndRequestInputRecovery();
     }
     function _ndRequestInputRecovery() {
         if (!_ndCanRecoverInput()) return;
@@ -3129,8 +3144,10 @@ function createNoteDetector(options = {}) {
                 await audioOpChain;
                 if (epoch !== inputRecoveryEpoch) return;
                 inputRecoveryPending = false;
+                const probe = inputRecoveryNeedsProbe;
+                inputRecoveryNeedsProbe = false;
                 if (!_ndCanRecoverInput() || enabled || !inputStartFailed
-                    || _ndGuitarProfiles()?.getSnapshot()?.applied !== true) return;
+                    || (!probe && _ndGuitarProfiles()?.getSnapshot()?.applied !== true)) return;
                 inputRecoveryStarting = true;
                 inputRecoveryRoute = inputReadyRoute;
                 try { await enable(); }
@@ -3145,6 +3162,7 @@ function createNoteDetector(options = {}) {
     function _ndCancelInputRecovery() {
         inputRecoveryEpoch++;
         inputRecoveryPending = false;
+        inputRecoveryNeedsProbe = false;
         if (inputRecoveryTimer != null) {
             clearTimeout(inputRecoveryTimer);
             inputRecoveryTimer = null;
@@ -4415,30 +4433,46 @@ function createNoteDetector(options = {}) {
     let detectBtn = null;
     let gearBtn = null;
     let inputStatus = null;
+    let sharedInputStatus = null;
 
     function _syncInputStatusVisibility() {
-        if (!inputStatus) return;
         const hidden = _scoringStalled || (isDefault && !!window.__ndSuppressDefault);
-        if (inputStatus.hidden !== hidden) inputStatus.hidden = hidden;
+        sharedInputStatus?.setHidden?.('input', hidden);
+        if (inputStatus && inputStatus.hidden !== hidden) inputStatus.hidden = hidden;
     }
 
     function _clearInputStatus() {
         inputStartFailed = false;
+        sharedInputStatus?.clear('input');
+        sharedInputStatus = null;
         if (inputStatus) inputStatus.remove();
         inputStatus = null;
     }
 
     function _showInputStatus(error) {
-        if (guitarProfilesDestroyed || (isDefault && window.__ndSuppressDefault)) return;
+        if (guitarProfilesDestroyed || (isDefault && window.__ndSuppressDefault)
+            || _ndInputAudioInitializing()) return;
+        const message = 'Audio input unavailable — note detection paused.';
+        const detailText = error && error.message ? String(error.message) : 'Select and start your audio input in Audio settings.';
+        const presenter = isDefault ? window.feedBackAudioStatus : null;
+        if (typeof presenter?.set === 'function' && typeof presenter?.clear === 'function') {
+            if (inputStatus) inputStatus.remove();
+            inputStatus = null;
+            sharedInputStatus = presenter;
+            presenter.set('input', { message, detail: detailText, hidden: _scoringStalled });
+            return;
+        }
+        // Older Core versions and independently mounted players keep their
+        // local status; the default instance uses Core's shared audio stack.
         if (!inputStatus) {
             const notice = document.createElement('div');
             notice.className = 'nd-input-status';
             notice.setAttribute('role', 'status');
             notice.setAttribute('aria-live', 'polite');
             notice.style.cssText = `position:${isDefault ? 'fixed' : 'absolute'};right:1rem;bottom:6rem;z-index:300;max-width:min(28rem,calc(100% - 2rem));box-sizing:border-box;padding:10px 12px;border:1px solid #8d713d;border-radius:8px;background:#29251c;color:#f4e4bd;font-size:13px;pointer-events:auto;`;
-            const message = document.createElement('span');
-            message.textContent = 'Audio input unavailable — note detection paused.';
-            notice.appendChild(message);
+            const label = document.createElement('span');
+            label.textContent = message;
+            notice.appendChild(label);
             const settings = document.createElement('button');
             settings.className = 'nd-input-status-settings';
             settings.type = 'button';
@@ -4467,8 +4501,7 @@ function createNoteDetector(options = {}) {
             inputStatus = notice;
         }
         const detail = inputStatus.querySelector('.nd-input-status-detail');
-        const message = error && error.message ? String(error.message) : 'Select and start your audio input in Audio settings.';
-        if (detail && detail.textContent !== message) detail.textContent = message;
+        if (detail && detail.textContent !== detailText) detail.textContent = detailText;
         _syncInputStatusVisibility();
     }
 
@@ -4610,6 +4643,7 @@ function createNoteDetector(options = {}) {
     // ── Audio pipeline ────────────────────────────────────────────────
     async function startAudio() {
         const startGeneration = sessionGen;
+        const startedInitializing = _ndInputAudioInitializing();
         try {
             // Desktop (Electron) bridge path. When the slopsmith-desktop
             // shell is hosting us, the native JUCE engine already owns
@@ -5190,7 +5224,10 @@ function createNoteDetector(options = {}) {
             // browsing or playback with a modal during automatic recovery.
             if (enabled && startGeneration === sessionGen) {
                 inputStartFailed = true;
-                if (!autoEnableTrial) _showInputStatus(e);
+                // An operation begun during startup can settle after Desktop's
+                // initialized event. Never surface that stale startup result;
+                // the initialized-event recovery waits for it and probes again.
+                if (!autoEnableTrial && !startedInitializing) _showInputStatus(e);
             }
             // Partial-init cleanup — if we got as far as acquiring the
             // stream or creating any AudioNodes before the throw, we
@@ -5276,6 +5313,9 @@ function createNoteDetector(options = {}) {
     function _scoringWatchdogTick() {
         const now = (typeof Date !== 'undefined' && Date.now) ? Date.now() : 0;
         _syncInputStatusVisibility();
+        if (_ndInputAudioInitializing()) {
+            _wdPlayStartT = 0; _clearScoringStall(); return;
+        }
         // In split mode the default singleton is suppressed — a panel owns
         // capture. Without this guard the watchdog would call enable() on the
         // suppressed default and bring the main HUD/mic back on top of P1.
@@ -16391,6 +16431,7 @@ function createNoteDetector(options = {}) {
     function destroy() {
         guitarProfilesDestroyed = true;
         if (isDefault) window.removeEventListener?.('feedback:audio-route-changed', _ndRequestInputRecovery);
+        if (isDefault) window.removeEventListener?.('feedback:audio-initialized', _ndOnAudioInitialized);
         guitarProfilesUnsubscribe?.();
         guitarProfilesUnsubscribe = null;
         // Silent disable on teardown: calling plain disable() would
@@ -19731,6 +19772,7 @@ function createNoteDetector(options = {}) {
     // Load Core's migrated Default guitar before using the legacy cached gain.
     void _ndSyncGuitarProfile().catch(error => console.warn('[note_detect] Guitar profiles unavailable:', error));
     if (isDefault) window.addEventListener?.('feedback:audio-route-changed', _ndRequestInputRecovery);
+    if (isDefault) window.addEventListener?.('feedback:audio-initialized', _ndOnAudioInitialized);
 
     // Register the draw hook once per instance. The hook early-returns
     // on !enabled so disabled instances cost essentially nothing.

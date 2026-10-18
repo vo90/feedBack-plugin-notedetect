@@ -73,13 +73,33 @@ function makeDocument() {
     return document;
 }
 
-function setup({ browser = false, detectWanted = false, autoEnable = false } = {}) {
+function setup({ browser = false, detectWanted = false, autoEnable = false, sharedStatus = false, initializing = false } = {}) {
     const document = makeDocument(), intervals = new Map(), timeouts = new Map();
     let sb, id = 0, now = 10000, refreshGate = null, mediaGate = null;
     const state = { loaded: true, gain: 1, applied: false, activeId: 'default', revision: 1,
         routeKey: 'microphone', route: { generation: 1 },
         error: 'Start and select your audio input before detecting notes.' };
-    const calls = { alerts: [], media: 0, refresh: 0, settings: [], errors: [] };
+    const calls = { alerts: [], media: 0, refresh: 0, settings: [], errors: [], statusSets: [], statusClears: [] };
+    const sharedCards = new Map();
+    const statusStack = document.createElement('div'); statusStack.className = 'feedback-audio-status';
+    const presenter = {
+        isInitializing: () => initializing,
+        set(channel, status) {
+            calls.statusSets.push({ channel, ...status });
+            if (initializing) return;
+            let card = sharedCards.get(channel);
+            if (!card) {
+                card = document.createElement('div'); card.className = 'nd-input-status';
+                const detail = document.createElement('span'); detail.className = 'nd-input-status-detail';
+                card.appendChild(detail); statusStack.appendChild(card); document.body.appendChild(statusStack);
+                sharedCards.set(channel, card);
+            }
+            card.querySelector('.nd-input-status-detail').textContent = status.detail;
+            card.hidden = !!status.hidden;
+        },
+        clear(channel) { calls.statusClears.push(channel); sharedCards.get(channel)?.remove(); sharedCards.delete(channel); },
+        setHidden(channel, hidden) { const card = sharedCards.get(channel); if (card) card.hidden = hidden; },
+    };
     const listeners = new Set(), events = new Map();
     const emitProfile = patch => {
         Object.assign(state, patch);
@@ -119,6 +139,7 @@ function setup({ browser = false, detectWanted = false, autoEnable = false } = {
         if (autoEnable) s.AudioContext = function () { return {}; };
         s.highway.getSongInfo = () => ({ arrangement: 'lead', stringCount: 6, tuningOffsets: [0, 0, 0, 0, 0, 0] });
         s.feedBack = { guitarProfiles: profiles };
+        if (sharedStatus) s.feedBackAudioStatus = presenter;
         s.navigator.mediaDevices.getUserMedia = async () => {
             calls.media++;
             if (mediaGate) return mediaGate;
@@ -133,12 +154,16 @@ function setup({ browser = false, detectWanted = false, autoEnable = false } = {
     } });
     assert.ok(sb.noteDetect, 'real plugin singleton must bootstrap successfully');
     return {
-        sb, core, document, state, calls, profiles, intervals, timeouts, events, emitProfile,
+        sb, core, document, state, calls, profiles, intervals, timeouts, events, emitProfile, sharedCards, statusStack,
         det: sb.noteDetect,
         notice: () => document.querySelector('.nd-input-status'),
         gateRefresh(promise) { refreshGate = promise; },
         gateMedia(promise) { mediaGate = promise; },
         routeChanged() { sb.dispatchEvent(new sb.CustomEvent('feedback:audio-route-changed')); },
+        finishInitialization() {
+            initializing = false;
+            sb.dispatchEvent(new sb.CustomEvent('feedback:audio-initialized'));
+        },
         async runRecovery() {
             await flush();
             for (const [timerId, timer] of [...timeouts]) if (timer.ms === 0) {
@@ -583,4 +608,134 @@ test('route notifications never acquire browser or secondary inputs', async t =>
     assert.equal(s.calls.media, 2);
     assert.equal(s.events.get('feedback:audio-route-changed').size, 1, 'only the default detector subscribes');
     assert.equal(secondary.isEnabled(), false);
+});
+
+test('native startup stays silent through the delayed retry and recovers after initialization', async t => {
+    const s = setup({ detectWanted: true, autoEnable: true, sharedStatus: true, initializing: true });
+    t.after(() => s.destroy());
+    await s.runRecovery();
+    const retries = [...s.timeouts.entries()].filter(([, timer]) => timer.ms === 1500);
+    assert.equal(retries.length, 1);
+    s.timeouts.delete(retries[0][0]); retries[0][1].fn();
+    await flush();
+    assert.equal(s.calls.refresh, 2);
+    assert.equal(s.notice(), null);
+    assert.deepEqual(s.calls.statusSets, [], 'intermediate failures are never queued in the presenter');
+    s.sb.slopsmith.isPlaying = true;
+    s.tickWatchdog(); s.tickWatchdog(3000);
+    assert.equal(s.document.querySelector('.nd-scoring-stall'), null, 'startup must not flash the scoring-stall banner either');
+    s.state.applied = true;
+    s.finishInitialization();
+    await s.runRecovery();
+    assert.equal(s.calls.refresh, 3, 'Desktop completion probes the settled input');
+    assert.equal(s.det.isEnabled(), true);
+    assert.equal(s.notice(), null);
+    assert.deepEqual(s.calls.statusSets, []);
+});
+
+test('initialization completion reports a fresh real failure even when no input was applied', async t => {
+    const s = setup({ detectWanted: true, sharedStatus: true, initializing: true });
+    t.after(() => s.destroy());
+    await s.det.enable();
+    assert.deepEqual(s.calls.statusSets, []);
+    s.state.error = 'The selected input is unavailable after startup.';
+    s.finishInitialization();
+    assert.equal(s.notice(), null, 'completion never reveals the earlier startup error');
+    await s.runRecovery();
+    assert.equal(s.calls.refresh, 2);
+    assert.equal(s.det.isEnabled(), false);
+    assert.equal(s.calls.statusSets.length, 1);
+    assert.equal(s.calls.statusSets[0].detail, s.state.error);
+    assert.equal(s.notice().parentNode, s.statusStack);
+    assert.equal(s.document.querySelectorAll('.nd-input-status').length, 1);
+    await s.runRecovery();
+    assert.equal(s.calls.refresh, 2, 'a failed settled probe does not loop');
+});
+
+test('a startup operation that fails after initialization cannot flash its stale error', async t => {
+    const s = setup({ detectWanted: true, sharedStatus: true, initializing: true });
+    t.after(() => s.destroy());
+    let release;
+    s.gateRefresh(new Promise(resolve => { release = resolve; }));
+    const enabling = s.det.enable();
+    await flush();
+    s.state.applied = true;
+    s.finishInitialization();
+    await s.runRecovery();
+    assert.equal(s.calls.refresh, 1, 'settled probe waits for the pending startup');
+    s.gateRefresh(null);
+    release({ ...s.state, applied: false, error: 'Stale startup failure' });
+    assert.equal(await enabling, false);
+    await flush();
+    assert.equal(s.calls.refresh, 2);
+    assert.equal(s.det.isEnabled(), true);
+    assert.equal(s.notice(), null);
+    assert.deepEqual(s.calls.statusSets, [], 'neither a queued error nor the late failure reaches the presenter');
+});
+
+test('shared input card updates, follows split visibility, and clears on successful recovery', async t => {
+    const s = setup({ detectWanted: true, sharedStatus: true }); t.after(() => s.destroy());
+    await s.det.enable();
+    const card = s.notice();
+    assert.equal(card.parentNode, s.statusStack);
+    assert.equal(s.calls.statusSets[0].channel, 'input');
+    assert.equal(s.calls.statusSets[0].message, 'Audio input unavailable — note detection paused.');
+    s.state.error = '<img src=x> Changed error';
+    await s.det.enable();
+    assert.equal(s.notice(), card);
+    assert.equal(s.calls.statusSets[1].detail, s.state.error);
+    assert.equal(s.document.querySelectorAll('.nd-input-status').length, 1);
+    s.core.createNoteDetector.setDefaultSuppressed(true); s.tickWatchdog();
+    assert.equal(card.hidden, true);
+    s.core.createNoteDetector.setDefaultSuppressed(false); s.tickWatchdog();
+    assert.equal(card.hidden, false);
+    s.emitProfile({ applied: true });
+    await s.runRecovery();
+    assert.equal(s.det.isEnabled(), true);
+    assert.equal(s.notice(), null);
+    assert.equal(card.isConnected, false);
+    assert.deepEqual(s.calls.statusClears, ['input']);
+});
+
+test('initialization recovery honors off, disable, suppression, external scoring and teardown', async t => {
+    for (const blockedBy of ['off', 'disable', 'split', 'external', 'destroy']) {
+        const s = setup({ detectWanted: blockedBy !== 'off', sharedStatus: true, initializing: true });
+        t.after(() => s.destroy());
+        await s.det.enable();
+        if (blockedBy === 'disable') s.det.disable({ silent: true });
+        if (blockedBy === 'split') s.core.createNoteDetector.setDefaultSuppressed(true);
+        if (blockedBy === 'external') s.sb.highway.getSongInfo = () => ({ arrangement: 'keys' });
+        if (blockedBy === 'destroy') s.det.destroy();
+        s.state.applied = true;
+        s.finishInitialization();
+        await s.runRecovery();
+        assert.equal(s.calls.refresh, 1, blockedBy);
+        assert.equal(s.det.isEnabled(), false, blockedBy);
+        assert.deepEqual(s.calls.statusSets, [], blockedBy);
+        if (blockedBy === 'destroy') assert.equal(s.events.get('feedback:audio-initialized').size, 0);
+    }
+});
+
+test('destroy clears its shared input card and initialized listener', async () => {
+    const s = setup({ sharedStatus: true });
+    await s.det.enable();
+    assert.ok(s.notice());
+    s.det.destroy();
+    assert.equal(s.notice(), null);
+    assert.deepEqual(s.calls.statusClears, ['input']);
+    assert.equal(s.events.get('feedback:audio-initialized').size, 0);
+});
+
+test('primary initialization does not hide an independently owned panel failure', async t => {
+    const s = setup({ browser: true, sharedStatus: true, initializing: true });
+    t.after(() => s.destroy());
+    const panel = s.document.createElement('div'); s.document.body.appendChild(panel);
+    const secondary = s.core.createNoteDetector({ isDefault: false, container: panel });
+    t.after(() => secondary.destroy());
+    await secondary.enable();
+    assert.ok(panel.querySelector('.nd-input-status'), 'independent input errors keep their local status');
+    assert.deepEqual(s.calls.statusSets, [], 'panels never share the primary input channel');
+    s.finishInitialization();
+    await s.runRecovery();
+    assert.equal(s.calls.media, 1, 'primary startup must not reopen an independently owned input');
 });
