@@ -106,6 +106,244 @@ function _ndInputGainWarning(rawPeak, gain) {
     return '';
 }
 
+// Verified calibration uses fresh raw windows and read-only candidate scoring.
+// These helpers are independent of wizard state so synthetic audio/IPC fixtures
+// exercise the same acceptance rules as the user workflow.
+function _ndCalV2Quantile(values, fraction) {
+    const sorted = values.filter(Number.isFinite).sort((a, b) => a - b);
+    return sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * fraction))] : 0;
+}
+function _ndCalV2Identity(snapshot) {
+    return {generation: snapshot.generation, channel: snapshot.channel, epoch: snapshot.epoch};
+}
+function _ndCalV2SameIdentity(a, b) {
+    return !!a && !!b && a.generation === b.generation && a.channel === b.channel && a.epoch === b.epoch;
+}
+function _ndCalV2Ready(snapshot, expected) {
+    if (!snapshot?.running || snapshot.channel < 0) throw new Error('Start an individual instrument input before measuring.');
+    if (expected && !_ndCalV2SameIdentity(snapshot, expected)) throw new Error('The input changed. Start this calibration again.');
+    if (snapshot.status !== 'ready' || !snapshot.complete)
+        throw new Error(snapshot.status === 'overflow' ? 'Input samples were missed. Retry this capture.' : 'Fresh input is not ready. Check the input and retry.');
+    if (!Number.isFinite(snapshot.sampleRate) || snapshot.sampleRate < 8000 || !Number.isSafeInteger(snapshot.sequence))
+        throw new Error('Invalid input measurement. Update the audio engine and retry.');
+}
+function _ndCalV2Summary(windows, sampleRate, kind, noise) {
+    if (!windows.length || !Number.isFinite(sampleRate) || sampleRate <= 0) throw new Error('No fresh input was captured. Retry.');
+    const frames = windows.length, durationMs = windows.reduce((n, w) => n + w.samples, 0) / sampleRate * 1000;
+    const peakMax = Math.max(...windows.map(w => w.peak));
+    const clippedSamples = windows.reduce((n, w) => n + w.clippedSamples, 0);
+    const invalidSamples = windows.reduce((n, w) => n + w.invalidSamples, 0);
+    if (invalidSamples) throw new Error('Invalid audio samples arrived. Check the input device and retry.');
+    if (clippedSamples || peakMax >= 0.98) throw new Error('The instrument input clipped. Lower the interface or device output level, then restart calibration.');
+    if (frames < 50 || durationMs < (kind === 'noise' ? 1000 : 2000)) throw new Error('Not enough fresh input was captured. Retry.');
+    const common = {frames, durationMs, peakMax, clippedSamples, invalidSamples};
+    if (kind === 'noise') {
+        const rmsP95 = _ndCalV2Quantile(windows.map(w => w.rms), 0.95);
+        if (peakMax > Math.max(0.002, rmsP95 * 20))
+            throw new Error('A bump or note interrupted the quiet capture. Mute the strings and retry.');
+        return {...common, rmsP95};
+    }
+    if (!noise) throw new Error('Capture muted strings first.');
+    const floor = Math.max(0.0003, noise.peakMax * 3, noise.rmsP95 * 6);
+    const active = windows.filter(w => w.peak >= floor);
+    const activeFrames = active.length;
+    let attackCount = 0, lastAttack = -Infinity, previousPeak = 0, elapsed = 0;
+    for (const w of windows) {
+        // Count separated rises, including restrums over a still-ringing note.
+        if (w.peak >= floor && w.peak >= Math.max(floor, previousPeak * 1.8) && elapsed - lastAttack >= 180) {
+            attackCount++; lastAttack = elapsed;
+        }
+        previousPeak = w.peak;
+        elapsed += w.samples / sampleRate * 1000;
+    }
+    if (activeFrames < Math.max(15, frames * 0.15) || attackCount < 3)
+        throw new Error('Play at least three separate strums or plucks across the capture. Leave a short gap between them, then retry.');
+    const peakP95 = _ndCalV2Quantile(active.map(w => w.peak), 0.95);
+    const rmsMedian = _ndCalV2Quantile(active.map(w => w.rms), 0.5);
+    if (peakMax > peakP95 * 4)
+        throw new Error('One unusually loud peak dominated the capture. Avoid cable bumps and repeat several consistent attacks.');
+    if (!(rmsMedian > 0) || rmsMedian < noise.rmsP95 * 8)
+        throw new Error('Playing is too close to the background noise. Check the cable and clean input, then restart calibration.');
+    return {...common, activeFrames, attackCount, peakP95, rmsMedian};
+}
+function _ndCalV2Candidate(capture) {
+    const {noise, normal, strong} = capture;
+    if (!noise || !normal || !strong) throw new Error('Complete quiet, normal and strong playing captures first.');
+    if (strong.peakMax < normal.peakMax * 0.8)
+        throw new Error('The strong take was quieter than your normal take. Retry strong playing with your strongest normal attacks.');
+    const gain = +Math.max(0.1, Math.min(5, 0.25 / strong.peakMax)).toFixed(4);
+    const noiseBound = noise.peakMax * gain * 6;
+    if (noiseBound > 0.02) throw new Error('Too much background noise remains at the required gain. Use a clean input and restart calibration.');
+    if (Math.max(normal.peakMax, strong.peakMax) * gain >= 0.98) throw new Error('The proposed gain has insufficient headroom. Lower the device output and restart calibration.');
+    return {gain, silenceThreshold: Math.max(0.002, noiseBound), capped: gain === 5 && strong.peakMax * gain < 0.25};
+}
+function _ndCalV2Tuning(instrument, stringCount, openStringMidi, referencePitchHz = 440, label = 'Custom tuning') {
+    const counts = instrument === 'guitar' ? [6, 7, 8] : instrument === 'bass' ? [4, 5, 6] : [];
+    if (!counts.includes(stringCount) || !Array.isArray(openStringMidi) || openStringMidi.length !== stringCount
+        || openStringMidi.some((n, s) => !Number.isInteger(n) || n < 0 || n > 127
+            || Math.abs(n - (_ndStandardMidiFor(instrument, stringCount)?.[s] ?? n)) > 24)
+        || !Number.isFinite(referencePitchHz) || referencePitchHz < 430 || referencePitchHz > 450)
+        throw new Error('Check the string count, open notes and reference pitch.');
+    if (openStringMidi.some(n => {
+        const frequency = referencePitchHz * 2 ** ((n - 69) / 12);
+        return frequency < 25 || frequency > 2000;
+    })) throw new Error('An open note is outside the supported 25–2000 Hz detection range. Check its octave and tuning.');
+    return {instrument, stringCount, openStringMidi: openStringMidi.slice(), referencePitchHz,
+        label: String(label || 'Custom tuning').replace(/[\x00-\x1f]/g, '').slice(0, 100)};
+}
+function _ndCalV2ParseNote(value) {
+    const match = /^([A-G])([#b]?)(-?\d)$/.exec(String(value).trim());
+    if (!match) return NaN;
+    return ({C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11}[match[1]])
+        + (match[2] === '#' ? 1 : match[2] === 'b' ? -1 : 0) + (Number(match[3]) + 1) * 12;
+}
+async function _ndCalV2Baseline(audio, expected, cancelled, wait) {
+    for (let tries = 0; tries < 30; tries++) {
+        const snapshot = await audio.getInputCalibrationSnapshot({expected});
+        if (cancelled()) throw new Error('Calibration cancelled.');
+        if (expected && !_ndCalV2SameIdentity(snapshot, expected)) _ndCalV2Ready(snapshot, expected);
+        if (snapshot?.running && ['warming-up', 'busy', ...(!expected ? ['changed'] : [])].includes(snapshot.status)) {
+            await wait(100); continue;
+        }
+        _ndCalV2Ready(snapshot, expected);
+        return snapshot;
+    }
+    throw new Error('Fresh input did not become ready. Check the device and retry.');
+}
+async function _ndCalV2Capture(audio, {kind, noise, expected, cancelled = () => false,
+    wait = ms => new Promise(resolve => setTimeout(resolve, ms)), onProgress = () => {}}) {
+    const initial = await _ndCalV2Baseline(audio, expected, cancelled, wait);
+    const identity = _ndCalV2Identity(initial), windows = [];
+    const duration = kind === 'noise' ? 2000 : 5000;
+    let cursor = initial.sequence, stalled = 0, samples = 0;
+    for (let tries = 0; tries < 200; tries++) {
+        await wait(80);
+        if (cancelled()) throw new Error('Calibration cancelled.');
+        const snapshot = await audio.getInputCalibrationSnapshot({expected: identity, afterSequence: cursor});
+        if (cancelled()) throw new Error('Calibration cancelled.');
+        if (snapshot?.status === 'busy' && _ndCalV2SameIdentity(snapshot, identity)) {
+            if (++stalled >= 8) throw new Error('Input readings remained busy. Retry this capture.');
+            continue;
+        }
+        _ndCalV2Ready(snapshot, identity);
+        if (snapshot.sampleRate !== initial.sampleRate) throw new Error('The sample rate changed. Restart calibration.');
+        if (snapshot.sequence === cursor) {
+            if (++stalled >= 8) throw new Error('Input readings stopped. Check the device and retry.');
+            continue;
+        }
+        stalled = 0;
+        for (const w of snapshot.windows || []) {
+            if (w.startSequence !== cursor || !Number.isSafeInteger(w.endSequence) || w.endSequence <= cursor
+                || w.samples !== w.endSequence - w.startSequence || !Number.isFinite(w.peak) || !Number.isFinite(w.rms)
+                || w.peak < 0 || w.rms < 0 || w.rms > w.peak + 1e-9
+                || !Number.isInteger(w.clippedSamples) || w.clippedSamples < 0
+                || !Number.isInteger(w.invalidSamples) || w.invalidSamples < 0)
+                throw new Error('Input samples were incomplete or invalid. Retry this capture.');
+            windows.push(w); samples += w.samples; cursor = w.endSequence;
+        }
+        if (cursor !== snapshot.sequence) throw new Error('Input samples were missed. Retry this capture.');
+        onProgress(Math.min(1, samples / initial.sampleRate * 1000 / duration));
+        if (samples / initial.sampleRate * 1000 >= duration)
+            return {identity, summary: _ndCalV2Summary(windows, initial.sampleRate, kind, noise)};
+    }
+    throw new Error('Input capture did not complete. Retry.');
+}
+function _ndCalV2CheckFrame(v, targetHz, threshold) {
+    const frequency = v?.pitch?.frequency, confidence = v?.pitch?.confidence;
+    const cents = frequency > 0 ? 1200 * Math.log2(frequency / targetHz) : Infinity;
+    const margin = Number.isFinite(v?.adjustedPeak) ? v.adjustedPeak / threshold : 0;
+    const passed = v?.status === 'ready' && v.clippedSamples === 0 && v.invalidSamples === 0
+        && v.adjustedPeak < 0.98 && v.passesSilenceGate === true && margin >= 1
+        && Number.isFinite(confidence) && confidence >= 0.75 && Math.abs(cents) <= 50
+        && v.result?.isHit === true && v.result?.results?.some(r => r.hit === true);
+    return {passed, cents, margin, rms: v?.adjustedRms || 0};
+}
+async function _ndCalV2Verify(audio, {identity, tuning, candidate, string, mode, normalCheck,
+    cancelled = () => false, wait = ms => new Promise(resolve => setTimeout(resolve, ms)), onProgress = () => {}}) {
+    const initial = await _ndCalV2Baseline(audio, identity, cancelled, wait);
+    const base = _ndStandardMidiFor(tuning.instrument, tuning.stringCount);
+    const params = _ndVerifyParamsFor(tuning.instrument);
+    const context = {arrangement: tuning.instrument, stringCount: tuning.stringCount,
+        offsets: tuning.openStringMidi.map((n, s) => n - base[s]), capo: 0, referencePitch: tuning.referencePitchHz,
+        pitchCheckCents: params.pitchCheckCents, harmonicSnr: params.harmonicSnr, fundamentalRatio: params.fundamentalRatio,
+        harmonicVerify: true, bypassMl: true, minHitRatio: 1, notes: [{s: string, f: 0}]};
+    const targetHz = tuning.referencePitchHz * 2 ** ((tuning.openStringMidi[string] - 69) / 12);
+    const frames = []; let cursor = initial.sequence, lastEnd = initial.sequence, observed = initial.sequence, started = null, stalled = 0;
+    for (let tries = 0; tries < 100; tries++) {
+        await wait(120);
+        if (cancelled()) throw new Error('Calibration cancelled.');
+        const snapshot = await audio.getInputCalibrationSnapshot({expected: identity, afterSequence: cursor,
+            verification: {gain: candidate.gain, silencePeakThreshold: candidate.silenceThreshold, context}});
+        if (cancelled()) throw new Error('Calibration cancelled.');
+        if (snapshot?.status === 'busy' && _ndCalV2SameIdentity(snapshot, identity)) {
+            if (++stalled >= 8) throw new Error('Input readings remained busy. Retry this string.');
+            continue;
+        }
+        _ndCalV2Ready(snapshot, identity);
+        if (snapshot.sampleRate !== initial.sampleRate) throw new Error('The sample rate changed. Restart calibration.');
+        if (snapshot.sequence <= observed) {
+            if (++stalled >= 8) throw new Error('Input readings stopped. Check the device and retry.');
+            continue;
+        }
+        observed = snapshot.sequence; stalled = 0;
+        const v = snapshot.verification;
+        if (v?.status !== 'ready' || !Number.isSafeInteger(v.startSequence) || !Number.isSafeInteger(v.endSequence)
+            || v.startSequence < lastEnd || v.endSequence <= v.startSequence || v.endSequence > snapshot.sequence) continue;
+        if (v.gain !== candidate.gain || v.silencePeakThreshold !== candidate.silenceThreshold)
+            throw new Error('The verification settings changed. Restart calibration.');
+        if (![v.rawPeak, v.adjustedPeak, v.adjustedRms].every(n => Number.isFinite(n) && n >= 0)
+            || v.clippedSamples !== 0 || v.invalidSamples !== 0 || v.rawPeak >= 0.98 || v.adjustedPeak >= 0.98)
+            throw new Error('The input clipped or contained invalid samples. Restart the level captures.');
+        lastEnd = v.endSequence; cursor = v.endSequence;
+        if (started === null && v.adjustedPeak < candidate.silenceThreshold) {
+            onProgress({waiting: true, frames: 0}); continue;
+        }
+        if (started === null) started = v.startSequence;
+        frames.push(_ndCalV2CheckFrame(v, targetHz, candidate.silenceThreshold));
+        const spanMs = (v.endSequence - started) / initial.sampleRate * 1000;
+        onProgress({waiting: false, frames: frames.length, passed: frames.filter(f => f.passed).length});
+        if (frames.length >= 8 && spanMs >= 800) {
+            const passed = frames.filter(f => f.passed);
+            if (passed.length < frames.length * 0.75) throw new Error('That string was not detected reliably at the expected pitch. Check its tuning and clean input, then retry.');
+            const softThresholdMargin = Math.min(...passed.map(f => f.margin));
+            if (mode === 'soft' && softThresholdMargin < 2) throw new Error('Soft playing is too close to the noise cutoff. Check input level or noise, then restart the level captures.');
+            const rmsMedian = _ndCalV2Quantile(passed.map(f => f.rms), 0.5);
+            if (mode === 'soft' && normalCheck?.rmsMedian && rmsMedian > normalCheck.rmsMedian * 0.85)
+                throw new Error('Play this string more softly than the normal check, then retry.');
+            return {string, mode, frames: frames.length, passedFrames: passed.length, spanMs,
+                medianCents: _ndCalV2Quantile(passed.map(f => f.cents), 0.5), softThresholdMargin, rmsMedian};
+        }
+    }
+    throw new Error('No reliable note was heard. Check the expected note and try this string again.');
+}
+function _ndCalV2Metadata(model) {
+    const {tuning, candidate, capture, checks} = model;
+    if (!candidate || checks.length !== tuning.stringCount * 2) throw new Error('Check every string normally and softly before saving.');
+    const seen = new Set();
+    for (const c of checks) {
+        const key = `${c.string}:${c.mode}`;
+        if (!Number.isInteger(c.string) || c.string < 0 || c.string >= tuning.stringCount || !['normal', 'soft'].includes(c.mode)
+            || seen.has(key) || c.frames < 6 || c.passedFrames / c.frames < 0.75 || c.spanMs < 600
+            || !Number.isFinite(c.medianCents) || Math.abs(c.medianCents) > 50
+            || c.softThresholdMargin < (c.mode === 'soft' ? 2 : 1)) throw new Error('String verification is incomplete. Repeat the failed check.');
+        seen.add(key);
+    }
+    return {method: 'guided-input-v2', rawPeak: capture.strong.peakMax, noisePeak: capture.noise.peakMax,
+        quality: {version: 2, status: 'verified', engine: 'native-harmonic-v1', candidateGain: candidate.gain,
+            silenceThreshold: candidate.silenceThreshold, tuning, capture,
+            checks: checks.map(({rmsMedian, ...evidence}) => evidence)}};
+}
+
+function _ndProfileSilenceThreshold(snapshot, gain) {
+    const q = snapshot?.calibrationQuality;
+    return snapshot?.loaded === true && snapshot.applied === true && !snapshot.error && !snapshot.busy
+        && snapshot.calibrated === true && snapshot.calibrationStatus === 'verified'
+        && q?.version === 2 && q.status === 'verified' && q.engine === 'native-harmonic-v1'
+        && q.tuning?.instrument === snapshot.activeType && q.candidateGain === snapshot.gain && gain === snapshot.gain
+        && Number.isFinite(snapshot.silenceThreshold) && snapshot.silenceThreshold >= 0.002 && snapshot.silenceThreshold <= 0.02
+        && q.silenceThreshold === snapshot.silenceThreshold ? snapshot.silenceThreshold : 0.02;
+}
+
 function _ndPresentationTime(hw, inputAgeSeconds = 0) {
     if (typeof hw?.getPresentationTime === 'function') return hw.getPresentationTime(inputAgeSeconds * 1000);
     return (hw?.getTime?.() || 0) + (hw?.getAvOffset?.() || 0) / 1000 - inputAgeSeconds;
@@ -430,7 +668,7 @@ const _ND_AUTO_ENABLE_RETRY_MS = 1500;
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.32.0';
+const _ND_VERSION = '1.33.0';
 
 // Bleed-rescue tuning for the low-bass blind spot. A bass DI's fundamental is
 // weaker than its 2nd harmonic and an open string / neighbour often rings the
@@ -678,7 +916,9 @@ function _ndSanitizeVerifyCtx(ctx) {
         }
         capo = Number.isInteger(ctx.capo) && ctx.capo >= 0 ? ctx.capo : 0;
     }
-    return { arrangement, stringCount, offsets, capo };
+    return { arrangement, stringCount, offsets, capo,
+        ...(Number.isFinite(ctx.referencePitch) && ctx.referencePitch >= 430 && ctx.referencePitch <= 450
+            ? {referencePitch: ctx.referencePitch} : {}) };
 }
 
 // Pick the arrangement (bass/guitar) whose standard tuning a set of absolute
@@ -704,8 +944,8 @@ function _ndInferArrangementFromOpenMidis(openMidis, stringCount) {
 // tunings. No module-level mutable fallbacks — the factory closure passes
 // its own state in.
 
-function _ndFreqToMidi(freq) {
-    return 12 * Math.log2(freq / 440) + 69;
+function _ndFreqToMidi(freq, referencePitch = 440) {
+    return 12 * Math.log2(freq / referencePitch) + 69;
 }
 
 // MIDI → scientific pitch name (e.g. 40 → "E2"). Rounds to the nearest
@@ -2063,12 +2303,11 @@ function _ndHpsDetect(buffer, sampleRate, minFreqHz = _ND_MIN_DETECTABLE_HZ) {
 // automatically.
 //
 // Returns [loHz, hiHz] for the given string/arrangement/stringCount/offsets/capo.
-function _ndStringBandHz(stringIdx, arrangement, stringCount, offsets, capo) {
+function _ndStringBandHz(stringIdx, arrangement, stringCount, offsets, capo, referencePitch = 440) {
     const openMidi = _ndMidiFromStringFret(stringIdx, 0, arrangement, stringCount, offsets, capo);
     const fret24Midi = openMidi + 24;
-    // MIDI → Hz: 440 * 2^((midi-69)/12)
-    const loHz = 440 * Math.pow(2, (openMidi - 69) / 12) * 0.90; // -10% margin
-    const hiHz = 440 * Math.pow(2, (fret24Midi - 69) / 12) * 1.10; // +10% margin
+    const loHz = referencePitch * Math.pow(2, (openMidi - 69) / 12) * 0.90; // -10% margin
+    const hiHz = referencePitch * Math.pow(2, (fret24Midi - 69) / 12) * 1.10; // +10% margin
     return [loHz, hiHz];
 }
 
@@ -2239,7 +2478,8 @@ function _ndConstraintCheckString(
     pitchCheckCents = 0,
     energyThreshold = 0.03,
     precomputedSpectrum = null,
-    precomputedTotalEnergy = null
+    precomputedTotalEnergy = null,
+    referencePitch = 440
 ) {
     // Optional precomputed spectrum + total energy let _ndScoreChord run
     // one FFT and one full-spectrum sum for the whole chord and reuse
@@ -2247,10 +2487,10 @@ function _ndConstraintCheckString(
     // _ndFftMagnitude is module-level, so callers must keep this
     // synchronous and not interleave other FFT-using detectors.
     const { magnitudes, binHz } = precomputedSpectrum || _ndFftMagnitude(buffer, sampleRate);
-    const [loHz, hiHz] = _ndStringBandHz(stringIdx, arrangement, stringCount, offsets, capo);
+    const [loHz, hiHz] = _ndStringBandHz(stringIdx, arrangement, stringCount, offsets, capo, referencePitch);
 
     const expectedMidi = _ndMidiFromStringFret(stringIdx, fret, arrangement, stringCount, offsets, capo);
-    const expectedHz = 440 * Math.pow(2, (expectedMidi - 69) / 12);
+    const expectedHz = referencePitch * Math.pow(2, (expectedMidi - 69) / 12);
 
     const bandEnergy = _ndBandEnergy(magnitudes, binHz, loHz, hiHz, precomputedTotalEnergy);
     const energyOk = bandEnergy >= energyThreshold;
@@ -2322,10 +2562,10 @@ function _ndConstraintCheckString(
 // Browser counterpart of the native explicit-pitch comb. Presence must
 // include the sounding fundamental; an octave or the rounded fretted note
 // cannot pass as an energy-only harmonic hit.
-function _ndCheckNaturalHarmonic(spectrum, total, note, arrangement, strings, offsets, capo, tolerance, solo = true, shift = 0) {
+function _ndCheckNaturalHarmonic(spectrum, total, note, arrangement, strings, offsets, capo, tolerance, solo = true, shift = 0, referencePitch = 440) {
     const {magnitudes: m, binHz} = spectrum;
     const midi = _ndMidiFromStringFret(note.s, _ndScoringFret(note) + shift, arrangement, strings, offsets, capo);
-    const f0 = 440 * Math.pow(2, (midi - 69) / 12);
+    const f0 = referencePitch * Math.pow(2, (midi - 69) / 12);
     const peak = hz => {
         const lo = Math.max(1, Math.floor(hz * .971 / binHz));
         const hi = Math.min(m.length - 2, Math.ceil(hz * 1.030 / binHz));
@@ -2351,19 +2591,19 @@ function _ndCheckNaturalHarmonic(spectrum, total, note, arrangement, strings, of
 
 // Explicit fretted targets use the same physical partial as native scoring.
 // Semi permits its fretted component but still needs selected-partial evidence.
-function _ndCheckFrettedHarmonic(spectrum, total, note, arrangement, strings, offsets, capo, tolerance, shift = 0) {
+function _ndCheckFrettedHarmonic(spectrum, total, note, arrangement, strings, offsets, capo, tolerance, shift = 0, referencePitch = 440) {
     const h = _ndFrettedHarmonic(note);
     if (!h) return {hit:false,bandEnergy:0,centsDiff:null,centsError:null};
     const {magnitudes:m,binHz}=spectrum;
     const baseMidi=_ndMidiFromStringFret(note.s,note.f+shift,arrangement,strings,offsets,capo);
-    const baseHz=440*2**((baseMidi-69)/12);
+    const baseHz=referencePitch*2**((baseMidi-69)/12);
     const partial=2**(_ndNaturalPitchSemitones(h.interval)/12);
     const mag=hz=>{
         const lo=Math.max(1,Math.floor(hz*.971/binHz)),hi=Math.min(m.length-2,Math.ceil(hz*1.030/binHz));
         let v=0;for(let k=lo;k<=hi;k++)v=Math.max(v,m[k]);return v;
     };
     const cents=note.b||note.sl ? Math.max(tolerance,100) : tolerance;
-    const check=_ndCheckNaturalHarmonic(spectrum,total,note,arrangement,strings,offsets,capo,cents,false,shift);
+    const check=_ndCheckNaturalHarmonic(spectrum,total,note,arrangement,strings,offsets,capo,cents,false,shift,referencePitch);
     const selected=mag(baseHz*partial),base=mag(baseHz);
     let evidence=selected >= base*(h.policy==='mixed' ? .65 : 1.05);
     for(let p=2;p<=8;p++) {
@@ -2376,7 +2616,7 @@ function _ndCheckFrettedHarmonic(spectrum, total, note, arrangement, strings, of
     check.targetFret=_ndScoringFret(note)+shift;
     if (!check.hit && h.policy==='attack_either') {
         const ordinary={...note};delete ordinary.harmonic_target;
-        const other=_ndCheckNaturalHarmonic(spectrum,total,ordinary,arrangement,strings,offsets,capo,cents,false,shift);
+        const other=_ndCheckNaturalHarmonic(spectrum,total,ordinary,arrangement,strings,offsets,capo,cents,false,shift,referencePitch);
         other.targetFret=note.f+shift;
         return other;
     }
@@ -2491,7 +2731,7 @@ function _ndKeysToReopenOnSeek(lastT, t, tolerance, keys) {
 //   - hm (harmonic): energy-only check (pitch check at fundamental is unreliable)
 //     — a future pass could check at 2x / 1.5x fundamental for stricter NYI
 //     classification.
-function _ndScoreChord(buffer, sampleRate, chordNotes, arrangement, stringCount, offsets, capo, pitchCheckCents, minHitRatio = 0.6) {
+function _ndScoreChord(buffer, sampleRate, chordNotes, arrangement, stringCount, offsets, capo, pitchCheckCents, minHitRatio = 0.6, referencePitch = 440) {
     let hitStrings = 0;
     const results = [];
 
@@ -2535,19 +2775,19 @@ function _ndScoreChord(buffer, sampleRate, chordNotes, arrangement, stringCount,
         }
 
         let check = cn.whammy ? null : cn.harmonic_target !== undefined
-            ? _ndCheckFrettedHarmonic(spectrum, totalEnergy, cn, arrangement, stringCount, offsets, capo, pitchCheckCents)
+            ? _ndCheckFrettedHarmonic(spectrum, totalEnergy, cn, arrangement, stringCount, offsets, capo, pitchCheckCents, 0, referencePitch)
             : _ndPreciseHarmonic(cn)
-            ? _ndCheckNaturalHarmonic(spectrum, totalEnergy, cn, arrangement, stringCount, offsets, capo, pitchCheckCents, chordNotes.length === 1)
+            ? _ndCheckNaturalHarmonic(spectrum, totalEnergy, cn, arrangement, stringCount, offsets, capo, pitchCheckCents, chordNotes.length === 1, 0, referencePitch)
             : _ndConstraintCheckString(
             buffer, sampleRate,
             cn.s, cn.f, arrangement, stringCount, offsets, capo,
-            cents, energyThreshold, spectrum, totalEnergy
+            cents, energyThreshold, spectrum, totalEnergy, referencePitch
         );
         if (cn.whammy) {
             const evaluate=shift=> {
                 const r=cn.harmonic_target !== undefined
-                    ? _ndCheckFrettedHarmonic(spectrum,totalEnergy,cn,arrangement,stringCount,offsets,capo,pitchCheckCents,shift)
-                    : _ndCheckNaturalHarmonic(spectrum,totalEnergy,cn,arrangement,stringCount,offsets,capo,pitchCheckCents,chordNotes.length===1,shift);
+                    ? _ndCheckFrettedHarmonic(spectrum,totalEnergy,cn,arrangement,stringCount,offsets,capo,pitchCheckCents,shift,referencePitch)
+                    : _ndCheckNaturalHarmonic(spectrum,totalEnergy,cn,arrangement,stringCount,offsets,capo,pitchCheckCents,chordNotes.length===1,shift,referencePitch);
                 return {...r,targetFret:Number.isFinite(r.targetFret)?r.targetFret:_ndScoringFret(cn)+shift};
             };
             check=evaluate(0);
@@ -3174,6 +3414,7 @@ function createNoteDetector(options = {}) {
         return isDefault ? window.feedBack?.guitarProfiles : null;
     }
     function _ndReceiveGuitarProfile(snapshot) {
+        _ND_SILENCE_THRESHOLD = _ndProfileSilenceThreshold(snapshot, snapshot?.gain);
         if (guitarProfilesDestroyed || snapshot?.loaded === false || !Number.isFinite(snapshot?.gain)) return;
         const readyRoute = snapshot.applied === true
             ? JSON.stringify([snapshot.routeKey, snapshot.route?.generation]) : null;
@@ -3505,7 +3746,7 @@ function createNoteDetector(options = {}) {
     const _ndLevelSamples = [];
     const _ND_LEVEL_HISTORY_S = 6;
     const _ND_LEVEL_WIN_HALF = 0.2;  // ±200 ms around chartTime
-    const _ND_SILENCE_THRESHOLD = 0.02;  // ~2% of full scale
+    let _ND_SILENCE_THRESHOLD = 0.02;  // Verified profiles may lower this with measured noise evidence.
 
     // Scoring
     let hits = 0;
@@ -3906,7 +4147,8 @@ function createNoteDetector(options = {}) {
     }
     function _ndVerifyActiveSig() {
         const c = _ndVerifyActiveCtx();
-        return _ndVerifySigFor(c.arrangement, c.stringCount, c.offsets, c.capo);
+        return _ndVerifySigFor(c.arrangement, c.stringCount, c.offsets, c.capo)
+            + '|' + (c.referencePitch ?? _ndReferencePitch(c.arrangement, c.stringCount));
     }
     // Last chord constraint result — shown in HUD when no single note is detected.
     // Reset on song change via resetScoring(). `lastChordTime` is the
@@ -3956,6 +4198,14 @@ function createNoteDetector(options = {}) {
     let tuningOffsets = [0, 0, 0, 0, 0, 0];
     let capo = 0;
     let currentStringCount = 6; // kept in sync with tuningOffsets.length
+    function _ndReferencePitch(arrangement = currentArrangement, stringCount = currentStringCount) {
+        const value = window.feedBack?.workingTuning?.get?.({instrument: arrangement, stringCount})?.referencePitch;
+        return Number.isFinite(value) && value >= 430 && value <= 450 ? value : 440;
+    }
+    function _ndNativePitchMidi(pitch) {
+        return pitch.frequency > 0 ? _ndFreqToMidi(pitch.frequency, _ndReferencePitch())
+            : pitch.midiNote - 12 * Math.log2(_ndReferencePitch() / 440);
+    }
 
     // Audio buffers
     let accumBuffer = new Float32Array(0);
@@ -4138,6 +4388,7 @@ function createNoteDetector(options = {}) {
         _ndHarmonicSupportBlocked = false;
     }
     async function _ndBridgeScoreChord(ctx) {
+        ctx = {referencePitch: _ndReferencePitch(ctx.arrangement, ctx.stringCount), ...ctx};
         const a = _ndBridgeAudio(); if (!a) return Promise.resolve(null);
         await _ndRequireHarmonicTargetSupport(a, ctx.notes);
         if (sourceId != null && typeof a.scoreSourceChord === 'function')
@@ -4153,6 +4404,7 @@ function createNoteDetector(options = {}) {
             : (typeof a.setChart === 'function' && typeof a.getNoteVerdicts === 'function');
     }
     async function _ndBridgeSetChart(chart) {
+        chart = {referencePitch: _ndReferencePitch(chart.arrangement, chart.stringCount), ...chart};
         const a = _ndBridgeAudio(); if (!a) return Promise.resolve(null);
         await refreshInputCalibration();
         if (!(chart.notes || []).some(n=>n.harmonic_target !== undefined || n.whammy !== undefined || n.harmonic_changes !== undefined)) {
@@ -4931,7 +5183,7 @@ function createNoteDetector(options = {}) {
                                         // the threshold must not store a pitch the
                                         // hold logic would then ignore (flicker).
                                         && lp.confidence > detectionConfidenceMin) {
-                                        detectedMidi = lp.midiNote;
+                                        detectedMidi = _ndNativePitchMidi(lp);
                                         detectedConfidence = lp.confidence;
                                         // This branch returns before matchNotes(),
                                         // so log the calibration detection here or
@@ -5003,7 +5255,7 @@ function createNoteDetector(options = {}) {
                                     if (bridgeOnsetPrimed
                                         && typeof n.confidence === 'number'
                                         && n.confidence >= detectionConfidenceMin) {
-                                        bridgeNewOnsets.set(n.midi, {
+                                        bridgeNewOnsets.set(Math.round(n.midi - 12 * Math.log2(_ndReferencePitch() / 440)), {
                                             ageMs: Number.isFinite(n.onsetMs) ? n.onsetMs : 0,
                                             conf: n.confidence,
                                         });
@@ -5025,7 +5277,7 @@ function createNoteDetector(options = {}) {
                                     }
                                 }
                                 if (best && best.confidence >= detectionConfidenceMin) {
-                                    detectedMidi = best.midi;
+                                    detectedMidi = best.midi - 12 * Math.log2(_ndReferencePitch() / 440);
                                     detectedConfidence = best.confidence;
                                 } else {
                                     detectedMidi = -1;
@@ -5039,7 +5291,7 @@ function createNoteDetector(options = {}) {
                                 if (!enabled || gen !== sessionGen) return;
                                 if (p && typeof p.midiNote === 'number' && p.midiNote >= 0
                                     && typeof p.confidence === 'number' && p.confidence >= detectionConfidenceMin) {
-                                    detectedMidi = p.midiNote;
+                                    detectedMidi = _ndNativePitchMidi(p);
                                     detectedConfidence = p.confidence;
                                 } else {
                                     detectedMidi = -1;
@@ -5893,7 +6145,7 @@ function createNoteDetector(options = {}) {
             // matchNotes() is gated on detectedMidi >= 0, so it skips
             // itself; only chord groups get evaluated here.
         } else {
-            detectedMidi = _ndFreqToMidi(result.freq);
+            detectedMidi = _ndFreqToMidi(result.freq, _ndReferencePitch());
             detectedConfidence = result.confidence;
         }
 
@@ -6198,9 +6450,9 @@ function createNoteDetector(options = {}) {
         const pitchError = hasExplicitPitchError
             ? extra.pitchError
             : (Number.isFinite(detectedMidiForJudgment) ? (detectedMidiForJudgment - expectedMidi) * 100 : null);
-        const expectedFreq = 440 * Math.pow(2, (expectedMidi - 69) / 12);
+        const expectedFreq = _ndReferencePitch() * Math.pow(2, (expectedMidi - 69) / 12);
         const detectedFreq = Number.isFinite(detectedMidiForJudgment)
-            ? 440 * Math.pow(2, (detectedMidiForJudgment - 69) / 12)
+            ? _ndReferencePitch() * Math.pow(2, (detectedMidiForJudgment - 69) / 12)
             : null;
         return _ndMakeJudgment({
             matched: true,
@@ -6277,7 +6529,7 @@ function createNoteDetector(options = {}) {
                 _rescueWindows++;
                 const cand = _ndConstraintCheckString(
                     win, sr, cn.s, cn.f, currentArrangement, currentStringCount,
-                    tuningOffsets, capo, _ND_VERIFY_PITCH_CENTS_BASS, 0.015
+                    tuningOffsets, capo, _ND_VERIFY_PITCH_CENTS_BASS, 0.015, null, null, _ndReferencePitch()
                 );
                 if (cand && cand.hit) { r = cand; break; }
                 // After the center window, bail the whole scan if silent.
@@ -6320,13 +6572,13 @@ function createNoteDetector(options = {}) {
             // Per-string energy — the wrong-string / ambient signal on a miss.
             const stringEnergy = new Array(currentStringCount);
             for (let s = 0; s < currentStringCount; s++) {
-                const [lo, hi] = _ndStringBandHz(s, currentArrangement, currentStringCount, tuningOffsets, capo);
+                const [lo, hi] = _ndStringBandHz(s, currentArrangement, currentStringCount, tuningOffsets, capo, _ndReferencePitch());
                 stringEnergy[s] = Math.round(_ndBandEnergy(magnitudes, binHz, lo, hi, total) * 1000) / 1000;
             }
             // Charted string's expected pitch + band peak — shared by both checks.
             const expectedMidi = _ndMidiFromStringFret(chartNote.s, _ndScoringFret(chartNote), currentArrangement, currentStringCount, tuningOffsets, capo);
-            const expHz = 440 * Math.pow(2, (expectedMidi - 69) / 12);
-            const [loHz, hiHz] = _ndStringBandHz(chartNote.s, currentArrangement, currentStringCount, tuningOffsets, capo);
+            const expHz = _ndReferencePitch() * Math.pow(2, (expectedMidi - 69) / 12);
+            const [loHz, hiHz] = _ndStringBandHz(chartNote.s, currentArrangement, currentStringCount, tuningOffsets, capo, _ndReferencePitch());
             const loBin = Math.max(0, Math.floor(loHz / binHz));
             const hiBin = Math.min(magnitudes.length - 1, Math.ceil(hiHz / binHz));
             let bandPk = 0;
@@ -6335,7 +6587,7 @@ function createNoteDetector(options = {}) {
             let muteFail = false;
             if (Number.isFinite(chartNote.f) && chartNote.f > 0) {
                 const openMidi = _ndMidiFromStringFret(chartNote.s, 0, currentArrangement, currentStringCount, tuningOffsets, capo);
-                const openHz = 440 * Math.pow(2, (openMidi - 69) / 12);
+                const openHz = _ndReferencePitch() * Math.pow(2, (openMidi - 69) / 12);
                 muteFail = _ndDetectMuteFail(magnitudes, binHz, expHz, openHz, bandPk);
             }
             // Presence: was the expected note actually there (player played it)?
@@ -6723,6 +6975,7 @@ function createNoteDetector(options = {}) {
                     stringCount: ctx.stringCount,
                     offsets: ctx.offsets.slice(0, ctx.stringCount),
                     capo: ctx.capo,
+                    referencePitch: ctx.referencePitch ?? _ndReferencePitch(ctx.arrangement, ctx.stringCount),
                     pitchCheckCents: verifyParams.pitchCheckCents,
                     minHitRatio: _ND_VERIFY_MIN_HIT_RATIO,
                     bypassMl: true,               // force the DSP scorer, not the ML path
@@ -6744,7 +6997,7 @@ function createNoteDetector(options = {}) {
             result = _ndScoreChord(
                 frameBuffer, sr, target,
                 ctx.arrangement, ctx.stringCount, ctx.offsets, ctx.capo,
-                verifyParams.pitchCheckCents, _ND_VERIFY_MIN_HIT_RATIO
+                verifyParams.pitchCheckCents, _ND_VERIFY_MIN_HIT_RATIO, ctx.referencePitch ?? _ndReferencePitch(ctx.arrangement, ctx.stringCount)
             );
         }
         if (result && result.isHit) {
@@ -6972,7 +7225,7 @@ function createNoteDetector(options = {}) {
                     // improvement on low strings whose bins resolve coarsely).
                     tuningOffsets, capo,
                     verifyParams.pitchCheckCents,
-                    chordHitRatio
+                    chordHitRatio, _ndReferencePitch()
                 );
             }
             // results[] is aligned 1:1 with the notes[] array we sent.
@@ -7129,7 +7382,7 @@ function createNoteDetector(options = {}) {
                         group, currentArrangement, currentStringCount,
                         tuningOffsets, capo,
                         centsTolerance,   // pitch check per string
-                        chordHitRatio     // min fraction of strings required
+                        chordHitRatio, _ndReferencePitch() // min fraction of strings required
                     );
                 }
 
@@ -8232,6 +8485,8 @@ function createNoteDetector(options = {}) {
                 }
                 // Channel selection can still change the route before measuring.
                 if (wiz.step !== 1 && !wiz.measurementOnly) wiz.profileLocked = true;
+                if (typeof audio?.getInputCalibrationSnapshot === 'function' && _ndGuitarProfiles())
+                    _calV2Initialize(wiz);
             }
         } catch (error) {
             if (_calWizardState === wiz) wiz.profileError = error.message;
@@ -8254,6 +8509,279 @@ function createNoteDetector(options = {}) {
             wiz.channelProbeAbort = null;
             wiz.channelProbeRunning = false;
         }
+    }
+
+    function _calV2Initialize(wiz) {
+        if (wiz.inputV2) return;
+        const instrument = wiz.instrumentType === 'bass' ? 'bass' : 'guitar';
+        let working = window.feedBack?.workingTuning?.get?.();
+        const stringCount = working?.instrument === instrument && (instrument === 'bass' ? [4, 5, 6] : [6, 7, 8]).includes(working.stringCount)
+            ? working.stringCount : instrument === 'bass' ? 4 : 6;
+        working = window.feedBack?.workingTuning?.get?.({instrument, stringCount}) || working;
+        const base = _ndStandardMidiFor(instrument, stringCount);
+        const offsets = working?.instrument === instrument && Array.isArray(working.offsets) ? working.offsets : [];
+        const notes = base.map((n, s) => n + (Number.isInteger(offsets[s]) ? offsets[s] : 0));
+        const reference = Number(working?.referencePitch);
+        const tuning = _ndCalV2Tuning(instrument, stringCount, notes, reference >= 430 && reference <= 450 ? reference : 440,
+            notes.every((n, s) => n === base[s]) ? 'Standard' : 'Current tuning');
+        wiz.inputV2 = {stage: 'setup', tuning, noteInputs: notes.map(_ndMidiToName), capture: {}, candidate: null,
+            checks: [], identity: null, message: '', error: '', catalog: null};
+        void _calV2KeepAlive(wiz);
+        // Read the same merged catalog as the tuner, including user tunings.
+        Promise.resolve().then(() => window.feedBack?.tunings?.get?.()
+            || (typeof fetch === 'function' ? fetch('/api/tunings').then(r => r.ok ? r.json() : null) : null)).then(value => {
+            if (_calWizardState !== wiz) return;
+            wiz.inputV2.catalog = value;
+            if (wiz.inputV2.stage === 'setup') renderCalibrationWizard();
+        }).catch(() => { /* Standard and explicit per-string notes remain usable. */ });
+    }
+    function _calV2Reset(wiz, kind = 'noise') {
+        const m = wiz.inputV2;
+        const order = ['noise', 'normal', 'strong'];
+        for (const name of order.slice(Math.max(0, order.indexOf(kind)))) delete m.capture[name];
+        m.candidate = null; m.checks = []; m.error = ''; m.message = '';
+        wiz.gainSaved = false; wiz.gainDraft = null; wiz.applied = null;
+    }
+    function _calV2AssertReference(wiz) {
+        const t = wiz.inputV2.tuning;
+        if (t.referencePitchHz !== _ndReferencePitch(t.instrument, t.stringCount))
+            throw new Error('Reference pitch changed. Close this calibration and start again with the tuner reference you will use to play.');
+    }
+    async function _calV2KeepAlive(wiz) {
+        const m = wiz.inputV2;
+        if (!m || m.keepAlivePending || _calWizardState !== wiz || wiz.profileError) return;
+        m.keepAlivePending = true;
+        try {
+            _calV2AssertReference(wiz);
+            // The raw capture lease expires after two seconds. Keep it alive
+            // during instructions/countdowns/review as well as active captures.
+            const snapshot = await _ndResolveAudioBridge().getInputCalibrationSnapshot({expected: m.identity || undefined});
+            if (_calWizardState !== wiz || !m.identity || snapshot.status === 'busy') return;
+            if (!_ndCalV2SameIdentity(snapshot, m.identity) || !snapshot.running || snapshot.status === 'stopped') {
+                _calWizardStopAutoCapture(); _calV2Reset(wiz); m.stage = 'noise';
+                wiz.profileError = 'The input changed. Close this calibration and start again.';
+                renderCalibrationWizard();
+            }
+        } catch (error) {
+            if (_calWizardState === wiz && m.identity) {
+                _calWizardStopAutoCapture(); _calV2Reset(wiz); m.stage = 'noise';
+                wiz.profileError = 'The input became unavailable. Close this calibration and start again.';
+                renderCalibrationWizard();
+            }
+        } finally { m.keepAlivePending = false; }
+    }
+    function _calV2CaptureOptions(m) {
+        const key = `${m.tuning.instrument}-${m.tuning.stringCount}`;
+        const exactMidis = m.catalog?.tuningMidis?.[key];
+        const byName = exactMidis || (m.catalog?.tunings || m.catalog)?.[key];
+        const reference = Number.isFinite(m.catalog?.referencePitch) ? m.catalog.referencePitch : 440;
+        const result = [{label: 'Standard', notes: _ndStandardMidiFor(m.tuning.instrument, m.tuning.stringCount).slice()}];
+        if (byName && typeof byName === 'object') for (const [label, frequencies] of Object.entries(byName)) {
+            if (label === 'Standard' || !Array.isArray(frequencies) || frequencies.length !== m.tuning.stringCount) continue;
+            const notes = exactMidis ? frequencies.slice() : frequencies.map(hz => Math.round(_ndFreqToMidi(hz, reference)));
+            if (notes.every(n => Number.isInteger(n) && n >= 0 && n <= 127)) result.push({label, notes});
+        }
+        return result;
+    }
+    function _calV2Status(wiz, message) {
+        if (_calWizardState !== wiz) return;
+        wiz.inputV2.message = message;
+        const el = _calWizardEl?.querySelector('.nd-cal-v2-progress');
+        if (el) el.textContent = message;
+    }
+    async function _calV2Countdown(wiz, token) {
+        for (let n = 3; n > 0; n--) {
+            if (_calWizardState !== wiz || wiz.autoCapture !== token) throw new Error('Calibration cancelled.');
+            _calV2Status(wiz, `Get ready… ${n}`);
+            await _calWizardSleep(1000);
+        }
+        if (_calWizardState !== wiz || wiz.autoCapture !== token) throw new Error('Calibration cancelled.');
+    }
+    async function _calV2Capture(wiz, kind) {
+        if (_calWizardState !== wiz || wiz.gainSaving || wiz.profilePending || wiz.profileError) return;
+        _calWizardStopAutoCapture();
+        _calV2Reset(wiz, kind);
+        const m = wiz.inputV2, token = {kind: 'verified-input', phase: kind};
+        wiz.autoCapture = token; renderCalibrationWizard();
+        const cancelled = () => _calWizardState !== wiz || wiz.autoCapture !== token || !!wiz.profileError;
+        try {
+            await _calWizardBindProfile(wiz, true);
+            _calV2AssertReference(wiz);
+            await _calV2Countdown(wiz, token);
+            const result = await _ndCalV2Capture(_ndResolveAudioBridge(), {kind, noise: m.capture.noise, expected: m.identity,
+                cancelled, onProgress: value => _calV2Status(wiz,
+                    `${kind === 'noise' ? 'Keep strings muted' : 'Keep playing separate attacks'} · ${Math.round(value * 100)}%`)});
+            await _calWizardBindProfile(wiz, true);
+            if (cancelled()) return;
+            m.identity = result.identity; m.capture[kind] = result.summary;
+            if (kind === 'strong') m.candidate = _ndCalV2Candidate(m.capture);
+            m.stage = {noise: 'normal', normal: 'strong', strong: 'verify'}[kind];
+            m.message = '';
+        } catch (error) {
+            if (!cancelled()) m.error = error.message;
+        } finally {
+            if (_calWizardState === wiz && wiz.autoCapture === token) {
+                _calWizardStopAutoCapture(); renderCalibrationWizard();
+            }
+        }
+    }
+    async function _calV2Check(wiz, string, mode) {
+        if (_calWizardState !== wiz || wiz.gainSaving || wiz.profilePending || wiz.profileError || !wiz.inputV2.candidate) return;
+        _calWizardStopAutoCapture();
+        const m = wiz.inputV2;
+        m.checks = m.checks.filter(c => !(c.string === string && (c.mode === mode || mode === 'normal')));
+        m.error = ''; wiz.gainSaved = false;
+        const token = {kind: 'verified-input', phase: 'check'};
+        wiz.autoCapture = token; renderCalibrationWizard();
+        const cancelled = () => _calWizardState !== wiz || wiz.autoCapture !== token || !!wiz.profileError;
+        try {
+            await _calWizardBindProfile(wiz, true);
+            _calV2AssertReference(wiz);
+            await _calV2Countdown(wiz, token);
+            const result = await _ndCalV2Verify(_ndResolveAudioBridge(), {identity: m.identity, tuning: m.tuning,
+                candidate: m.candidate, string, mode, normalCheck: m.checks.find(c => c.string === string && c.mode === 'normal'),
+                cancelled, onProgress: progress => _calV2Status(wiz,
+                    progress.waiting ? `Play ${_ndMidiToName(m.tuning.openStringMidi[string])} ${mode === 'soft' ? 'softly' : 'normally'} now`
+                        : `Listening · ${progress.passed} of ${progress.frames} readings detected`)});
+            await _calWizardBindProfile(wiz, true);
+            if (cancelled()) return;
+            m.checks.push(result); m.message = '';
+            if (m.checks.length === m.tuning.stringCount * 2) m.stage = 'review';
+        } catch (error) {
+            if (!cancelled()) m.error = error.message;
+        } finally {
+            if (_calWizardState === wiz && wiz.autoCapture === token) {
+                _calWizardStopAutoCapture(); renderCalibrationWizard();
+            }
+        }
+    }
+    async function _calV2Save(wiz) {
+        if (_calWizardState !== wiz || wiz.autoCapture || wiz.gainSaving || wiz.profilePending || wiz.profileError) return;
+        const m = wiz.inputV2;
+        wiz.gainSaving = true; m.error = ''; renderCalibrationWizard();
+        try {
+            const metadata = _ndCalV2Metadata(m), gain = m.candidate.gain;
+            await _calWizardBindProfile(wiz, true);
+            _calV2AssertReference(wiz);
+            if (_calWizardState !== wiz) return;
+            const snapshot = await _ndResolveAudioBridge().getInputCalibrationSnapshot({expected: m.identity});
+            if (_calWizardState !== wiz) return;
+            _calV2AssertReference(wiz);
+            _ndCalV2Ready(snapshot, m.identity);
+            if (wiz.measurementOnly) {
+                await _calWizardBindProfile(wiz, true);
+                if (_calWizardState !== wiz) return;
+                wiz.measurementResult = {gain, metadata, context: wiz.draftContext};
+                calibrationWizardClose();
+            } else {
+                await _ndSaveInputGain(gain, wiz.profileContext, metadata, () => _calWizardState !== wiz);
+                if (_calWizardState !== wiz) return;
+                wiz.profileContext = await _ndGuitarProfiles().captureContext();
+                if (_calWizardState !== wiz) return;
+                wiz.gainSaved = true; wiz.applied = {inputGain: gain}; m.stage = 'saved';
+            }
+        } catch (error) {
+            if (_calWizardState === wiz) m.error = error.message;
+        } finally {
+            wiz.gainSaving = false;
+            if (_calWizardState === wiz) renderCalibrationWizard();
+        }
+    }
+    function _calV2Next(wiz) {
+        const m = wiz.inputV2;
+        if (wiz.autoCapture || wiz.gainSaving || wiz.profilePending || wiz.profileError) return;
+        try {
+            if (m.stage === 'setup') {
+                m.tuning = _ndCalV2Tuning(m.tuning.instrument, m.tuning.stringCount,
+                    m.noteInputs.map(_ndCalV2ParseNote), Number(m.tuning.referencePitchHz), m.tuning.label);
+                m.stage = 'noise';
+            } else if (m.stage === 'saved') { calibrationWizardClose(); return; }
+            else if (m.stage === 'noise' && m.capture.noise) m.stage = 'normal';
+            else if (m.stage === 'normal' && m.capture.normal) m.stage = 'strong';
+            else if (m.stage === 'strong' && m.candidate) m.stage = 'verify';
+            else if (m.stage === 'verify' && m.checks.length === m.tuning.stringCount * 2) m.stage = 'review';
+            m.error = '';
+        } catch (error) { m.error = error.message; }
+        renderCalibrationWizard();
+    }
+    function _calV2Render(wiz) {
+        const m = wiz.inputV2, body = _calWizardEl.querySelector('.nd-cal-body');
+        const busy = !!wiz.autoCapture || wiz.gainSaving || wiz.profilePending || !!wiz.profileError;
+        const labels = {setup: 'Confirm tuning', noise: 'Muted strings', normal: 'Normal playing', strong: 'Strong playing',
+            verify: 'Check every string', review: 'Review', saved: 'Saved'};
+        _calWizardEl.querySelector('.nd-cal-title').textContent = `Calibrate ${wiz.profileName || 'instrument'} — ${labels[m.stage]}`;
+        const back = _calWizardEl.querySelector('.nd-cal-back'), next = _calWizardEl.querySelector('.nd-cal-next');
+        back.style.visibility = m.stage === 'setup' || m.stage === 'saved' ? 'hidden' : 'visible';
+        back.disabled = wiz.gainSaving;
+        next.style.display = m.stage === 'review' ? 'none' : '';
+        next.textContent = m.stage === 'saved' ? 'Done' : 'Next';
+        next.disabled = busy || (['noise', 'normal'].includes(m.stage) && !m.capture[m.stage])
+            || (m.stage === 'strong' && !m.candidate) || (m.stage === 'verify' && m.checks.length !== m.tuning.stringCount * 2);
+        const esc = _ndEscapeHtml;
+        let html = `<p class="text-gray-300 mb-3">${esc(wiz.profileRoute || '')}</p>`;
+        if (m.stage === 'setup') {
+            const counts = m.tuning.instrument === 'bass' ? [4, 5, 6] : [6, 7, 8];
+            const options = _calV2CaptureOptions(m);
+            html += `<p class="text-gray-300 mb-3">Use your usual pickup and volume settings. Keep the interface gain fixed. Confirm the notes your open strings are tuned to, from lowest to highest.</p>
+                <label class="block mb-2">Strings <select class="nd-cal-v2-strings bg-dark-600 p-2 rounded">${counts.map(n => `<option value="${n}"${n === m.tuning.stringCount ? ' selected' : ''}>${n}</option>`).join('')}</select></label>
+                <label class="block mb-2">Tuning <select class="nd-cal-v2-tuning w-full bg-dark-600 p-2 rounded"><option value="">${esc(m.tuning.label)}</option>${options.map((t, i) => t.label === m.tuning.label ? '' : `<option value="${i}">${esc(t.label)}</option>`).join('')}</select></label>
+                <div class="grid grid-cols-3 gap-2 mb-3">${m.noteInputs.map((note, s) => `<label class="text-gray-300">String ${m.tuning.stringCount - s}<input class="nd-cal-v2-note w-full bg-dark-600 p-2 rounded" data-string="${s}" value="${esc(note)}" aria-label="Open note for string ${m.tuning.stringCount - s}"></label>`).join('')}</div>
+                <p class="text-gray-300">Reference pitch: A4 = ${m.tuning.referencePitchHz} Hz. To change it, set the reference in the tuner before starting calibration.</p>`;
+        } else if (['noise', 'normal', 'strong'].includes(m.stage)) {
+            const instruction = m.stage === 'noise' ? 'Mute every string and keep your hands resting on them for two seconds.'
+                : m.stage === 'normal' ? 'Play at least four separate normal strums or plucks across five seconds. Leave a short gap between attacks.'
+                    : 'Play at least four of your strongest normal strums or plucks across five seconds. Leave a short gap between attacks.';
+            html += `<p class="text-gray-300 mb-3">${instruction}</p><button type="button" class="nd-cal-v2-capture w-full py-3 bg-accent rounded-lg text-white">${m.capture[m.stage] ? 'Repeat capture' : 'Start capture'}</button>`;
+            const c = m.capture[m.stage];
+            if (c) html += `<p class="mt-2 text-green-300">Captured ${Math.round(c.durationMs / 1000)} seconds · peak ${(c.peakMax * 100).toFixed(2)}%${c.attackCount ? ` · ${c.attackCount} attacks` : ''}</p>`;
+        } else if (m.stage === 'verify' || m.stage === 'review') {
+            html += `<p class="text-gray-300 mb-2">Proposed input gain ${_calWizardFmtGain(m.candidate.gain)} · strongest peak at this gain ${(m.capture.strong.peakMax * m.candidate.gain * 100).toFixed(1)}%.</p>`;
+            if (m.candidate.capped) html += '<p class="text-amber-200 mb-2">Maximum 5× boost reached. The target level was not reached; every string must still pass normal and soft detection checks.</p>';
+            const pending = [];
+            for (let s = 0; s < m.tuning.stringCount; s++) for (const mode of ['normal', 'soft'])
+                if (!m.checks.some(c => c.string === s && c.mode === mode)) pending.push({string: s, mode});
+            html += `<div class="space-y-1 mb-3">${m.tuning.openStringMidi.map((note, s) => {
+                const normal = m.checks.some(c => c.string === s && c.mode === 'normal'), soft = m.checks.some(c => c.string === s && c.mode === 'soft');
+                return `<div class="flex justify-between gap-2"><span>String ${m.tuning.stringCount - s} · ${_ndMidiToName(note)}</span><span>${normal ? '✓ Normal' : '— Normal'} · ${soft ? '✓ Soft' : '— Soft'}</span></div>`;
+            }).join('')}</div>`;
+            if (m.stage === 'verify' && pending.length) {
+                const target = pending[0];
+                html += `<p class="text-gray-300 mb-3">Pluck only string ${m.tuning.stringCount - target.string} (${_ndMidiToName(m.tuning.openStringMidi[target.string])}) ${target.mode === 'soft' ? 'gently, more softly than the normal check' : 'with your normal touch'}, and let it ring. Keep the other strings muted.</p>
+                    <button type="button" class="nd-cal-v2-check w-full py-3 bg-accent rounded-lg text-white" data-string="${target.string}" data-mode="${target.mode}">Check ${target.mode === 'soft' ? 'soft' : 'normal'} note</button>`;
+            } else if (m.stage === 'review') {
+                html += `<p class="text-green-300 mb-3">Every string passed normal and soft checks at this gain.</p><p class="text-gray-300 mb-3">Noise separation: ${(20 * Math.log10(m.capture.normal.rmsMedian / Math.max(m.capture.noise.rmsP95, 1e-9))).toFixed(1)} dB. Keep the same input, pickup, volume and hardware gain settings.</p>
+                    <button type="button" class="nd-cal-v2-save w-full py-3 bg-accent rounded-lg text-white">${wiz.measurementOnly ? 'Use verified calibration' : 'Save verified calibration'}</button>`;
+            }
+            html += '<button type="button" class="nd-cal-v2-restart w-full py-2 mt-2 bg-dark-600 rounded-lg">Restart level captures</button>';
+        } else html += '<p class="text-green-300">Verified input calibration saved.</p>';
+        html += `<p class="nd-cal-v2-progress text-cyan-300 mt-3" role="status">${esc(m.message || '')}</p>`;
+        if (m.error || wiz.profileError) html += `<p class="text-amber-200 mt-2" role="alert">${esc(wiz.profileError || m.error)}</p>`;
+        if (wiz.profilePending) html += '<p class="text-gray-300 mt-2">Loading instrument…</p>';
+        body.innerHTML = html;
+        body.querySelectorAll('button, input, select').forEach(el => { el.disabled = busy; });
+        const capture = body.querySelector('.nd-cal-v2-capture');
+        if (capture) capture.onclick = () => _calV2Capture(wiz, m.stage);
+        const check = body.querySelector('.nd-cal-v2-check');
+        if (check) check.onclick = () => _calV2Check(wiz, Number(check.getAttribute('data-string')), check.getAttribute('data-mode'));
+        const save = body.querySelector('.nd-cal-v2-save'); if (save) save.onclick = () => _calV2Save(wiz);
+        const restart = body.querySelector('.nd-cal-v2-restart');
+        if (restart) restart.onclick = () => { if (busy) return; _calV2Reset(wiz); m.stage = 'noise'; renderCalibrationWizard(); };
+        const strings = body.querySelector('.nd-cal-v2-strings');
+        if (strings) strings.onchange = () => {
+            _calV2Reset(wiz);
+            m.tuning = _ndCalV2Tuning(m.tuning.instrument, Number(strings.value),
+                _ndStandardMidiFor(m.tuning.instrument, Number(strings.value)).slice(), _ndReferencePitch(m.tuning.instrument, Number(strings.value)), 'Standard');
+            m.noteInputs = m.tuning.openStringMidi.map(_ndMidiToName); renderCalibrationWizard();
+        };
+        const named = body.querySelector('.nd-cal-v2-tuning');
+        if (named) named.onchange = () => {
+            const selected = _calV2CaptureOptions(m)[Number(named.value)];
+            if (named.value === '' || !selected) return;
+            _calV2Reset(wiz); m.tuning.label = selected.label; m.noteInputs = selected.notes.map(_ndMidiToName); renderCalibrationWizard();
+        };
+        body.querySelectorAll('.nd-cal-v2-note').forEach(input => { input.oninput = () => {
+            _calV2Reset(wiz); m.noteInputs[Number(input.getAttribute('data-string'))] = input.value; m.tuning.label = 'Custom tuning';
+        }; });
     }
 
     function _calWizardNoiseStatus(avgPct) {
@@ -8519,19 +9047,46 @@ function createNoteDetector(options = {}) {
         tick();
     }
 
+    async function _calWizardPrepareLevelCapture(wiz, kind) {
+        if (_calWizardState !== wiz || wiz.gainSaving) return false;
+        _calWizardStopAutoCapture();
+        // A retry replaces the previous measurement immediately, including while
+        // profile readiness is pending. Failed or cancelled retries must not
+        // leave an old gain proposal available to save.
+        wiz.levelCaptureStarted = true;
+        wiz.signal = null;
+        wiz.rawSignalIdentity = null;
+        wiz.gainDraft = null;
+        wiz.gainSaved = false;
+        wiz.gainError = null;
+        wiz.recommended.inputGain = null;
+        delete wiz.recommended.reasons.inputGain;
+        if (kind === 'noise') {
+            wiz.noise = null;
+            wiz.rawNoiseIdentity = null;
+        }
+        const request = { kind, phase: 'preparing' };
+        wiz.autoCapture = request;
+        renderCalibrationWizard();
+        try {
+            await _calWizardBindProfile(wiz, true);
+            if (_calWizardState !== wiz || wiz.autoCapture !== request) return false;
+            if (!getCalibrationSnapshot().enabled) throw new Error('Turn Detect on first.');
+            _calWizardStopAutoCapture();
+            return true;
+        } catch (error) {
+            if (_calWizardState === wiz && wiz.autoCapture === request) {
+                _calWizardStopAutoCapture();
+                renderCalibrationWizard();
+                _calWizardSetAutoStatus(`<span class="text-amber-200">${_ndEscapeHtml(error.message)}</span>`);
+            }
+            return false;
+        }
+    }
+
     async function _calWizardStartNoiseCapture() {
         const wiz = _calWizardState;
-        if (!wiz) return;
-        try { await _calWizardBindProfile(wiz, true); }
-        catch (error) {
-            if (_calWizardState === wiz) _calWizardSetAutoStatus(`<span class="text-amber-200">${_ndEscapeHtml(error.message)}</span>`);
-            return;
-        }
-        const snap = getCalibrationSnapshot();
-        if (!snap.enabled) {
-            _calWizardSetAutoStatus('<span class="text-amber-200/90">Turn Detect on first.</span>');
-            return;
-        }
+        if (!wiz || !await _calWizardPrepareLevelCapture(wiz, 'noise')) return;
         if (_calWizardStartRawCapture(wiz, 'noise')) return;
         _calWizardBeginCountdownThen('noise', 3, () => {
             _calWizardSetAutoStatus('<span class="text-cyan-300/90">Listening…</span> Mute all strings.');
@@ -8609,7 +9164,8 @@ function createNoteDetector(options = {}) {
             const valid = s?.running && _ndInputMeasurementKey(s) === _ndInputMeasurementKey(wiz.channelSnapshot);
             const apply = _calWizardEl?.querySelector('.nd-cal-save-gain');
             if (apply) apply.disabled = !valid || !!wiz.autoCapture || !!wiz.gainSaving || !!wiz.profileError
-                || !!wiz.profilePending || !!wiz.signal?.clipped || (wiz.levelsOnly && !wiz.signal?.captured);
+                || !!wiz.profilePending || !!wiz.signal?.clipped
+                || ((wiz.levelsOnly || wiz.levelCaptureStarted) && !wiz.signal?.captured);
             if (!valid) { if (el) el.textContent = 'Input changed — return to Audio Input and confirm the channel.'; return; }
             const peak = s.channels.find(c => c.index === s.selected)?.peak || 0;
             const live = _calWizardEl?.querySelector('.nd-cal-live-level');
@@ -8628,6 +9184,8 @@ function createNoteDetector(options = {}) {
         wiz.gainError = null;
         try {
             await _calWizardBindProfile(wiz, true);
+            if ((wiz.levelsOnly || wiz.levelCaptureStarted) && !wiz.signal?.captured)
+                throw new Error('Capture your playing level before using this calibration.');
             if (wiz.signal?.clipped) throw new Error(_ndInputGainWarning(wiz.signal.rawPeak, 1));
             const audio = _ndResolveAudioBridge();
             if (_calWizardHasRawInput(wiz)) {
@@ -8683,17 +9241,7 @@ function createNoteDetector(options = {}) {
 
     async function _calWizardStartSignalCapture() {
         const wiz = _calWizardState;
-        if (!wiz) return;
-        try { await _calWizardBindProfile(wiz, true); }
-        catch (error) {
-            if (_calWizardState === wiz) _calWizardSetAutoStatus(`<span class="text-amber-200">${_ndEscapeHtml(error.message)}</span>`);
-            return;
-        }
-        const snap = getCalibrationSnapshot();
-        if (!snap.enabled) {
-            _calWizardSetAutoStatus('<span class="text-amber-200/90">Turn Detect on first.</span>');
-            return;
-        }
+        if (!wiz || !await _calWizardPrepareLevelCapture(wiz, 'signal')) return;
         if (_calWizardStartRawCapture(wiz, 'signal')) return;
         if (_ndGuitarProfiles() && _ndResolveAudioBridge()) {
             _calWizardSetAutoStatus('<span class="text-amber-200">Choose an individual audio input channel before measuring. This requires current Desktop raw input meters.</span>');
@@ -8798,7 +9346,12 @@ function createNoteDetector(options = {}) {
             currentArrangement = arrangement;
             currentStringCount = stringCount;
         }
-        const offsets = Array.isArray(tuningOffsets) ? tuningOffsets : [0, 0, 0, 0, 0, 0];
+        if (!hasTuning) {
+            try { working = window.feedBack?.workingTuning?.get?.({instrument: arrangement, stringCount}) || working; } catch (_) {}
+        }
+        const offsets = hasTuning ? (Array.isArray(tuningOffsets) ? tuningOffsets : [])
+            : working?.instrument === arrangement && working.stringCount === stringCount && Array.isArray(working.offsets)
+                ? working.offsets : Array(stringCount).fill(0);
         // `preset` is the standalone instrument the user picked (or null). When
         // set we know the real open-string notes even with no song loaded, so
         // labels should show them instead of the generic Low E / Open A.
@@ -8808,7 +9361,7 @@ function createNoteDetector(options = {}) {
     function _calWizardOpenStringMidi(stringIndex, ctx) {
         const { hasTuning, arrangement, stringCount, offsets } = ctx;
         let expectedMidi = null;
-        if (hasTuning) {
+        if (hasTuning || Array.isArray(offsets)) {
             try {
                 const computed = _ndMidiFromStringFret(
                     stringIndex, 0, arrangement, stringCount, offsets, 0);
@@ -8970,7 +9523,7 @@ function createNoteDetector(options = {}) {
 
     function _calWizardMidiNearTarget(detectedMidi, targetMidi, centsTol) {
         if (!Number.isFinite(detectedMidi) || !Number.isFinite(targetMidi)) return false;
-        return Math.abs(_ndNearestOctaveCents(detectedMidi, targetMidi)) <= centsTol;
+        return Math.abs((detectedMidi - targetMidi) * 100) <= centsTol;
     }
 
     function _calWizardStopAllStringsRun(reason, opts) {
@@ -9079,7 +9632,7 @@ function createNoteDetector(options = {}) {
             const tick = () => {
                 const s = getCalibrationSnapshot();
                 const heardMidi = _calWizardRawPitchFields().rawMidi;
-                if (_calWizardMidiNearTarget(heardMidi, spec.expectedMidi, 100)) {
+                if (_calWizardMidiNearTarget(heardMidi, spec.expectedMidi, 50)) {
                     stable.push({ midi: heardMidi, conf: detectedConfidence, t: Date.now() });
                 } else {
                     stable.length = 0;
@@ -9818,7 +10371,7 @@ function createNoteDetector(options = {}) {
         _calWizardStopTimedPlayAlong('close');
         // A measurement-only wizard never opened the tuner. Restarting audio
         // here would invalidate the route context being returned to Core.
-        if (_calHadWizard && !measurementOnly) _calWizardReleaseTuner();
+        if (_calHadWizard && !measurementOnly && !_calWizardState?.inputV2) _calWizardReleaseTuner();
         if (_calWizardTick) {
             clearInterval(_calWizardTick);
             _calWizardTick = null;
@@ -10018,6 +10571,7 @@ function createNoteDetector(options = {}) {
 
     function renderCalibrationWizard() {
         if (!_calWizardEl || !_calWizardState) return;
+        if (_calWizardState.inputV2 && _calWizardState.step !== 1) { _calV2Render(_calWizardState); return; }
         const body = _calWizardEl.querySelector('.nd-cal-body');
         const title = _calWizardEl.querySelector('.nd-cal-title');
         const backBtn = _calWizardEl.querySelector('.nd-cal-back');
@@ -10131,7 +10685,7 @@ function createNoteDetector(options = {}) {
                     <input id="nd-cal-input-gain" class="nd-cal-input-gain w-full" type="range" min="0.1" max="5" step="0.01" value="${wiz.gainDraft ?? engineInputGain ?? inputGain}">
                     <p class="nd-cal-gain-preview text-xs text-cyan-300 my-2" role="status">Reading input…</p>
                     <p class="text-xs text-gray-400 mb-2">${wiz.measurementOnly ? 'This level will be applied when you save the instrument. ' : 'Preview the level while playing. Applies to note detection and in-game effects. '}Leave headroom for your strongest playing.</p>
-                    <button type="button" class="nd-cal-save-gain w-full py-2 bg-accent rounded-lg text-xs font-semibold text-white" ${wiz.signal?.clipped || (wiz.levelsOnly && !wiz.signal?.captured) ? 'disabled' : ''}>${wiz.measurementOnly ? 'Use calibration' : 'Apply and save gain'}</button>
+                    <button type="button" class="nd-cal-save-gain w-full py-2 bg-accent rounded-lg text-xs font-semibold text-white" ${wiz.autoCapture || wiz.signal?.clipped || ((wiz.levelsOnly || wiz.levelCaptureStarted) && !wiz.signal?.captured) ? 'disabled' : ''}>${wiz.measurementOnly ? 'Use calibration' : 'Apply and save gain'}</button>
                     ${wiz.gainSaved ? '<p class="text-xs text-green-300 mt-2">Input gain saved.</p>' : ''}
                 </div>` : '<p class="text-[10px] text-gray-500">For a quiet signal, adjust input gain. If clipping, lower gain. On desktop, choose an individual channel in Audio Input to preview and save game gain here.</p>'}`;
         } else if (step === 5) {
@@ -10263,6 +10817,7 @@ function createNoteDetector(options = {}) {
         if (wiz.gainError) html = `<p class="text-amber-200 text-xs mb-2" role="alert">${_ndEscapeHtml(wiz.gainError)}</p>` + html;
         if (wiz.detectError) html = `<p class="text-amber-200 text-xs mb-2" role="alert">${_ndEscapeHtml(wiz.detectError)}</p>` + html;
         if (wiz.levelsOnly && step === 3) html = '<p class="text-gray-300 text-xs mb-2">Use your usual pickup and instrument volume settings. Keep the interface gain knob unchanged after calibration.</p>' + html;
+        if (step === 3 || step === 4) html = '<p class="text-amber-200 text-xs mb-2">Level calibration only. This flow does not verify every string at the proposed gain. Use instrument calibration in the updated desktop app for normal and soft note checks.</p>' + html;
         if (wiz.profilePending || wiz.profileError) {
             html = `<p class="text-amber-200 text-xs mb-2" role="status">${_ndEscapeHtml(wiz.profileError || 'Loading instrument and audio input…')}</p>` + html;
             if (nextBtn) nextBtn.disabled = true;
@@ -10471,6 +11026,7 @@ function createNoteDetector(options = {}) {
 
     function calibrationWizardNext() {
         if (!_calWizardState) return;
+        if (_calWizardState.inputV2 && _calWizardState.step !== 1) { _calV2Next(_calWizardState); return; }
         if (_calWizardState.levelsOnly) {
             const wiz = _calWizardState;
             if (wiz.profilePending || wiz.profileError) return;
@@ -10495,6 +11051,14 @@ function createNoteDetector(options = {}) {
 
     function calibrationWizardBack() {
         if (!_calWizardState || _calWizardState.step <= 0) return;
+        if (_calWizardState.inputV2) {
+            const wiz = _calWizardState, m = wiz.inputV2;
+            if (wiz.gainSaving || m.stage === 'saved') return;
+            _calWizardStopAutoCapture();
+            const stages = ['setup', 'noise', 'normal', 'strong', 'verify', 'review'];
+            m.stage = stages[Math.max(0, stages.indexOf(m.stage) - 1)]; m.message = ''; m.error = '';
+            renderCalibrationWizard(); return;
+        }
         if (_calWizardState.levelsOnly && _calWizardState.step !== 4) return;
         _calWizardStopAllStringsRun('back');
         _calWizardStopAutoCapture();
@@ -10567,7 +11131,9 @@ function createNoteDetector(options = {}) {
                 calibrationWizardClose();
                 return;
             }
+            if (_calWizardState?.inputV2) void _calV2KeepAlive(_calWizardState);
             if (_calWizardState && !_calWizardState.tunerMinimized
+                && (!_calWizardState.inputV2 || _calWizardState.step === 1)
                 && _calWizardState.step >= 1 && _calWizardState.step <= 6) {
                 _calWizardRefreshLive();
                 if (_calWizardState.step === 1) _calWizardRefreshChannels();
@@ -14724,7 +15290,7 @@ function createNoteDetector(options = {}) {
         const notes = _ndChartNotes();
         const chords = _ndChartChords();
         const context = currentArrangement + ':' + currentStringCount + ':' + capo
-            + ':' + timingTolerance + ':' + pitchTolerance;
+            + ':' + timingTolerance + ':' + pitchTolerance + ':' + _ndReferencePitch();
         const previous = _ndChartSignatureCache;
         if (previous && previous.context === context
             && _ndSignatureEqual(tuningOffsets, previous.tuning)
@@ -15454,6 +16020,7 @@ function createNoteDetector(options = {}) {
                 stringCount,
                 tuningOffsets: offsets,
                 capo: containedCapo,
+                referencePitch: vctx?.referencePitch ?? _ndReferencePitch(arrangement, stringCount),
                 // A contained consumer has no host Pitch-tolerance slider —
                 // use the arrangement's verify cents (guitar 50 / bass 60).
                 pitchCheckCents: arrangement === 'bass'

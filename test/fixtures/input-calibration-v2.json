@@ -1,0 +1,168 @@
+{
+  "method": "guided-input-v2",
+  "rawPeak": 0.1,
+  "noisePeak": 0.0001,
+  "quality": {
+    "version": 2,
+    "status": "verified",
+    "engine": "native-harmonic-v1",
+    "candidateGain": 2.5,
+    "silenceThreshold": 0.002,
+    "tuning": {
+      "instrument": "guitar",
+      "stringCount": 6,
+      "openStringMidi": [
+        40,
+        45,
+        50,
+        55,
+        59,
+        64
+      ],
+      "referencePitchHz": 440,
+      "label": "Standard"
+    },
+    "capture": {
+      "noise": {
+        "frames": 100,
+        "durationMs": 2000,
+        "rmsP95": 5e-05,
+        "peakMax": 0.0001,
+        "clippedSamples": 0,
+        "invalidSamples": 0
+      },
+      "normal": {
+        "frames": 200,
+        "durationMs": 4000,
+        "activeFrames": 120,
+        "attackCount": 5,
+        "rmsMedian": 0.025,
+        "peakP95": 0.075,
+        "peakMax": 0.1,
+        "clippedSamples": 0,
+        "invalidSamples": 0
+      },
+      "strong": {
+        "frames": 200,
+        "durationMs": 4000,
+        "activeFrames": 120,
+        "attackCount": 5,
+        "rmsMedian": 0.025,
+        "peakP95": 0.075,
+        "peakMax": 0.1,
+        "clippedSamples": 0,
+        "invalidSamples": 0
+      }
+    },
+    "checks": [
+      {
+        "string": 0,
+        "mode": "normal",
+        "frames": 10,
+        "passedFrames": 9,
+        "spanMs": 900,
+        "medianCents": 4,
+        "softThresholdMargin": 3
+      },
+      {
+        "string": 0,
+        "mode": "soft",
+        "frames": 10,
+        "passedFrames": 9,
+        "spanMs": 900,
+        "medianCents": 4,
+        "softThresholdMargin": 3
+      },
+      {
+        "string": 1,
+        "mode": "normal",
+        "frames": 10,
+        "passedFrames": 9,
+        "spanMs": 900,
+        "medianCents": 4,
+        "softThresholdMargin": 3
+      },
+      {
+        "string": 1,
+        "mode": "soft",
+        "frames": 10,
+        "passedFrames": 9,
+        "spanMs": 900,
+        "medianCents": 4,
+        "softThresholdMargin": 3
+      },
+      {
+        "string": 2,
+        "mode": "normal",
+        "frames": 10,
+        "passedFrames": 9,
+        "spanMs": 900,
+        "medianCents": 4,
+        "softThresholdMargin": 3
+      },
+      {
+        "string": 2,
+        "mode": "soft",
+        "frames": 10,
+        "passedFrames": 9,
+        "spanMs": 900,
+        "medianCents": 4,
+        "softThresholdMargin": 3
+      },
+      {
+        "string": 3,
+        "mode": "normal",
+        "frames": 10,
+        "passedFrames": 9,
+        "spanMs": 900,
+        "medianCents": 4,
+        "softThresholdMargin": 3
+      },
+      {
+        "string": 3,
+        "mode": "soft",
+        "frames": 10,
+        "passedFrames": 9,
+        "spanMs": 900,
+        "medianCents": 4,
+        "softThresholdMargin": 3
+      },
+      {
+        "string": 4,
+        "mode": "normal",
+        "frames": 10,
+        "passedFrames": 9,
+        "spanMs": 900,
+        "medianCents": 4,
+        "softThresholdMargin": 3
+      },
+      {
+        "string": 4,
+        "mode": "soft",
+        "frames": 10,
+        "passedFrames": 9,
+        "spanMs": 900,
+        "medianCents": 4,
+        "softThresholdMargin": 3
+      },
+      {
+        "string": 5,
+        "mode": "normal",
+        "frames": 10,
+        "passedFrames": 9,
+        "spanMs": 900,
+        "medianCents": 4,
+        "softThresholdMargin": 3
+      },
+      {
+        "string": 5,
+        "mode": "soft",
+        "frames": 10,
+        "passedFrames": 9,
+        "spanMs": 900,
+        "medianCents": 4,
+        "softThresholdMargin": 3
+      }
+    ]
+  }
+}
