@@ -199,7 +199,9 @@ function _ndCalV2ParseNote(value) {
 }
 async function _ndCalV2Baseline(audio, expected, cancelled, wait) {
     for (let tries = 0; tries < 30; tries++) {
-        const snapshot = await audio.getInputCalibrationSnapshot({expected});
+        // IPC preserves present undefined/null values; omit an unbound identity
+        // so the strict native parser can establish the first capture epoch.
+        const snapshot = await audio.getInputCalibrationSnapshot(expected == null ? {} : {expected});
         if (cancelled()) throw new Error('Calibration cancelled.');
         if (expected && !_ndCalV2SameIdentity(snapshot, expected)) _ndCalV2Ready(snapshot, expected);
         if (snapshot?.running && ['warming-up', 'busy', ...(!expected ? ['changed'] : [])].includes(snapshot.status)) {
@@ -8555,7 +8557,8 @@ function createNoteDetector(options = {}) {
             _calV2AssertReference(wiz);
             // The raw capture lease expires after two seconds. Keep it alive
             // during instructions/countdowns/review as well as active captures.
-            const snapshot = await _ndResolveAudioBridge().getInputCalibrationSnapshot({expected: m.identity || undefined});
+            const snapshot = await _ndResolveAudioBridge().getInputCalibrationSnapshot(
+                m.identity == null ? {} : {expected: m.identity});
             if (_calWizardState !== wiz || !m.identity || snapshot.status === 'busy') return;
             if (!_ndCalV2SameIdentity(snapshot, m.identity) || !snapshot.running || snapshot.status === 'stopped') {
                 _calWizardStopAutoCapture(); _calV2Reset(wiz); m.stage = 'noise';

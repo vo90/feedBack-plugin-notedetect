@@ -15,9 +15,20 @@ const candidate = {gain: 2.5, silenceThreshold: .002};
 // verification frames, using the same cursor/identity contract as Desktop.
 function source(options = {}) {
     let sequence = 0, calls = 0, index = 0;
-    const api = {kind: 'noise', mode: 'normal', stalled: false, changed: false, requests: [],
+    const api = {kind: 'noise', mode: 'normal', stalled: false, changed: false, requests: [], invalidRequests: [],
         async getInputCalibrationSnapshot(request = {}) {
+            // Electron IPC uses structured clone: a present undefined field
+            // survives and the native parser rejects it, unlike JSON encoding.
+            request = structuredClone(request);
             calls++; api.requests.push(request);
+            if (Object.hasOwn(request, 'expected') && (!request.expected || typeof request.expected !== 'object'
+                || Array.isArray(request.expected) || ['generation', 'channel', 'epoch'].some(key =>
+                    !Number.isSafeInteger(request.expected[key]) || request.expected[key] < 0
+                    || (key === 'channel' && request.expected[key] > 4095)))) {
+                api.invalidRequests.push(request);
+                return {version: 1, status: 'invalid-request', running: false, generation: 0, channel: -1,
+                    epoch: 0, sampleRate: 0, sequence: 0, oldestSequence: 0, complete: false, windows: []};
+            }
             const sr = options.sampleRate || 48000, bucket = sr / 50;
             if (options.warmup && calls <= options.warmup) return {running: true, ...identity, status: 'warming-up', complete: false};
             const windows = [];
@@ -66,6 +77,43 @@ test('raw capture waits for warm-up, counts fresh samples, and detects repeated 
     assert.ok(take.summary.attackCount >= 8);
     assert.equal(take.summary.clippedSamples, 0);
     assert.equal(take.summary.invalidSamples, 0);
+});
+
+for (const expected of [null, undefined]) test(`initial ${expected} identity is omitted across the native capture boundary`, async () => {
+    const audio = source();
+    const quiet = await scope._ndCalV2Capture(audio, {kind: 'noise', expected, wait});
+    assert.ok(quiet.summary.durationMs >= 2000);
+    assert.equal(Object.hasOwn(audio.requests[0], 'expected'), false);
+    assert.ok(audio.requests.slice(1).every(request => request.expected?.epoch === identity.epoch));
+    assert.deepEqual(audio.invalidRequests, []);
+});
+
+test('malformed present identities still reach strict native validation', async () => {
+    for (const expected of [false, 0, '', [], {...identity, channel: 4096}]) {
+        const audio = source();
+        await assert.rejects(scope._ndCalV2Capture(audio, {kind: 'noise', expected, wait}), /Start an individual/);
+        assert.equal(audio.invalidRequests.length, 1);
+        assert.deepEqual(audio.invalidRequests[0].expected, expected);
+    }
+});
+
+test('wizard keepalive omits absent identity and binds it after the first capture through strict IPC', async () => {
+    const audio = source(), s = setup({nativeV2: audio});
+    try {
+        await s.open();
+        await s.refreshWizard();
+        assert.ok(audio.requests.length >= 2, 'opening and instruction tick both renew the capture lease');
+        assert.ok(audio.requests.every(request => !Object.hasOwn(request, 'expected')));
+        assert.deepEqual(audio.invalidRequests, []);
+        s.overlay.querySelector('.nd-cal-next').onclick();
+        await s.body.querySelector('.nd-cal-v2-capture').onclick();
+        assert.match(s.body.innerHTML, /normal strums or plucks/);
+        const before = audio.requests.length;
+        await s.refreshWizard();
+        assert.equal(audio.requests.length, before + 1);
+        assert.deepEqual(audio.requests.at(-1).expected, identity);
+        assert.deepEqual(audio.invalidRequests, []);
+    } finally { s.det.destroy(); }
 });
 
 test('lone attack, steady noise, dominant outlier, clipping and invalid samples are rejected', () => {
